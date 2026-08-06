@@ -1,8 +1,6 @@
-version: '3.8'
-
 # ============================================================
 # GPU模式（默认）：docker-compose up -d
-# CPU模式：docker-compose --profile cpu up -d
+# CPU模式：docker-compose down; docker-compose --profile cpu up -d pdf2word-cpu
 # ============================================================
 #
 # 多卡环境配置说明：
@@ -19,7 +17,6 @@ services:
   pdf2word:
     build: .
     container_name: pdf2word
-    profiles: ["", "gpu"]
     ports:
       - "8000:8000"
     environment:
@@ -43,7 +40,7 @@ services:
               capabilities: [gpu]
 
   # ---- CPU版（无GPU环境使用）----
-  # 启动命令: docker-compose --profile cpu up -d
+  # 启动命令: docker-compose --profile cpu up -d pdf2word-cpu
   pdf2word-cpu:
     build:
       context: .
