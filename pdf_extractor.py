@@ -278,8 +278,9 @@ def _setup_gpu_memory_limit():
     """设置GPU显存限制（在PaddleOCR初始化前调用）
 
     根据 PADDLE_GPU_MEMORY_GB 配置，自动计算占GPU总显存的比例并设置上限。
+    使用 PADDLE_GPU_ID 指定的显卡。
     """
-    from config import PADDLE_DEVICE, PADDLE_GPU_MEMORY_GB
+    from config import PADDLE_DEVICE, PADDLE_GPU_MEMORY_GB, PADDLE_GPU_ID
 
     if PADDLE_DEVICE != 'gpu' or not PADDLE_GPU_MEMORY_GB:
         return
@@ -290,14 +291,16 @@ def _setup_gpu_memory_limit():
             print("[WARNING] PaddlePaddle未编译GPU支持，回退到CPU模式")
             return
 
-        # 查询GPU总显存
-        gpu_props = paddle.device.cuda.get_device_properties(0)
+        # 查询指定GPU的总显存
+        gpu_props = paddle.device.cuda.get_device_properties(PADDLE_GPU_ID)
         total_gb = gpu_props.total_memory / (1024 ** 3)
+        gpu_name = gpu_props.name
 
         # 计算比例并设置
         fraction = min(PADDLE_GPU_MEMORY_GB / total_gb, 1.0)
-        paddle.device.set_memory_fraction(fraction)
-        print(f"[INFO] GPU显存限制: {PADDLE_GPU_MEMORY_GB}GB / {total_gb:.1f}GB (占比 {fraction:.1%})")
+        paddle.device.set_memory_fraction(fraction, PADDLE_GPU_ID)
+        print(f"[INFO] GPU{PADDLE_GPU_ID} ({gpu_name}) 显存限制: "
+              f"{PADDLE_GPU_MEMORY_GB}GB / {total_gb:.1f}GB (占比 {fraction:.1%})")
     except Exception as e:
         print(f"[WARNING] GPU显存限制设置失败: {e}，将使用默认显存策略")
 
@@ -314,7 +317,7 @@ def extract_scanned_pdf(pdf_path: str) -> List[ContentElement]:
 
     注意：OCR无法获取字体名/字号/粗体信息，用bbox高度估算字号。
     """
-    from config import PDF_TYPE_DETECTION, OCR_FONT_SIZE_FACTOR, PADDLE_DEVICE
+    from config import PDF_TYPE_DETECTION, OCR_FONT_SIZE_FACTOR, PADDLE_DEVICE, PADDLE_GPU_ID
     import numpy as np
 
     dpi = PDF_TYPE_DETECTION['ocr_dpi']
@@ -333,6 +336,9 @@ def extract_scanned_pdf(pdf_path: str) -> List[ContentElement]:
                 "PaddleOCR未安装，请运行: pip install paddlepaddle paddleocr"
             )
 
+    # 构造设备参数：gpu:0, gpu:1, gpu:2...
+    device = f'gpu:{PADDLE_GPU_ID}' if PADDLE_DEVICE == 'gpu' else 'cpu'
+
     engine = PPStructureV3(
         show_log=False,
         use_doc_orientation_classify=False,
@@ -341,7 +347,7 @@ def extract_scanned_pdf(pdf_path: str) -> List[ContentElement]:
         use_chart_recognition=False,
         use_formula_recognition=True,
         use_table_recognition=True,
-        device=PADDLE_DEVICE,
+        device=device,
     )
 
     doc = fitz.open(pdf_path)

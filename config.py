@@ -147,6 +147,11 @@ OCR_FONT_SIZE_FACTOR = 0.8  # font_size ≈ bbox_height * 72 / dpi * factor
 # 支持环境变量 PADDLE_DEVICE 覆盖（Docker中使用）
 PADDLE_DEVICE = os.environ.get('PADDLE_DEVICE', 'gpu')
 
+# GPU卡号选择（0, 1, 2, 3...）
+# 指定使用哪张显卡，多卡环境下必配
+# 也可通过 CUDA_VISIBLE_DEVICES 环境变量控制（Docker推荐用后者）
+PADDLE_GPU_ID = int(os.environ.get('PADDLE_GPU_ID', '0'))
+
 # GPU显存限制（GB）
 # 显卡共享时设置此项，限制PaddleOCR最大使用的显存
 # 设为 None 则不限制（使用全部可用显存）

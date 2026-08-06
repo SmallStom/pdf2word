@@ -4,6 +4,15 @@ version: '3.8'
 # GPU模式（默认）：docker-compose up -d
 # CPU模式：docker-compose --profile cpu up -d
 # ============================================================
+#
+# 多卡环境配置说明：
+#   CUDA_VISIBLE_DEVICES: 指定使用哪张物理卡（0, 1, 2, 3）
+#   PADDLE_GPU_MEMORY_GB: 限制该卡使用的显存（GB）
+#
+# 例如：用第2张卡，限制3GB显存：
+#   CUDA_VISIBLE_DEVICES=2
+#   PADDLE_GPU_MEMORY_GB=3
+# ============================================================
 
 services:
   # ---- GPU版（默认）----
@@ -18,6 +27,8 @@ services:
       - PORT=8000
       - HF_ENDPOINT=https://hf-mirror.com
       - PADDLE_DEVICE=gpu
+      # 指定使用哪张GPU（0/1/2/3），多卡共享时必改
+      - CUDA_VISIBLE_DEVICES=0
       # GPU显存限制（GB），显卡共享时修改此值
       - PADDLE_GPU_MEMORY_GB=4
     volumes:
