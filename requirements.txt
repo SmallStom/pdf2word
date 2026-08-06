@@ -1,11 +1,28 @@
+# PDF转Word格式规范化系统 - Python依赖
+# ============================================================
+
+# PDF处理
 PyMuPDF>=1.24.0
 pdfplumber>=0.11.0
+
+# PaddlePaddle - 二选一（取消注释切换）
+# CPU版（默认，内存约1.5-2GB）
 paddlepaddle>=3.0.0
+# GPU版（显存约1-2GB，推理快5-10倍，需CUDA环境）
+# paddlepaddle-gpu>=3.0.0
+
+# OCR
 paddleocr>=3.0.0
+
+# Word文档生成
 python-docx>=1.1.0
+
+# Web服务
 fastapi>=0.115.0
 uvicorn>=0.30.0
 python-multipart>=0.0.9
+
+# 图像处理
 opencv-python-headless>=4.10.0
 numpy>=1.26.0
 Pillow>=10.0.0

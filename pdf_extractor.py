@@ -286,7 +286,7 @@ def extract_scanned_pdf(pdf_path: str) -> List[ContentElement]:
 
     注意：OCR无法获取字体名/字号/粗体信息，用bbox高度估算字号。
     """
-    from config import PDF_TYPE_DETECTION, OCR_FONT_SIZE_FACTOR
+    from config import PDF_TYPE_DETECTION, OCR_FONT_SIZE_FACTOR, PADDLE_DEVICE
     import numpy as np
 
     dpi = PDF_TYPE_DETECTION['ocr_dpi']
@@ -310,6 +310,7 @@ def extract_scanned_pdf(pdf_path: str) -> List[ContentElement]:
         use_chart_recognition=False,
         use_formula_recognition=True,
         use_table_recognition=True,
+        device=PADDLE_DEVICE,
     )
 
     doc = fitz.open(pdf_path)
