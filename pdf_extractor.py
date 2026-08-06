@@ -274,6 +274,34 @@ def _detect_alignment(bbox, page_width) -> str:
 # ============================================================
 # 扫描件提取（PaddleOCR PP-StructureV3）
 # ============================================================
+def _setup_gpu_memory_limit():
+    """设置GPU显存限制（在PaddleOCR初始化前调用）
+
+    根据 PADDLE_GPU_MEMORY_GB 配置，自动计算占GPU总显存的比例并设置上限。
+    """
+    from config import PADDLE_DEVICE, PADDLE_GPU_MEMORY_GB
+
+    if PADDLE_DEVICE != 'gpu' or not PADDLE_GPU_MEMORY_GB:
+        return
+
+    try:
+        import paddle
+        if not paddle.device.is_compiled_with_cuda():
+            print("[WARNING] PaddlePaddle未编译GPU支持，回退到CPU模式")
+            return
+
+        # 查询GPU总显存
+        gpu_props = paddle.device.cuda.get_device_properties(0)
+        total_gb = gpu_props.total_memory / (1024 ** 3)
+
+        # 计算比例并设置
+        fraction = min(PADDLE_GPU_MEMORY_GB / total_gb, 1.0)
+        paddle.device.set_memory_fraction(fraction)
+        print(f"[INFO] GPU显存限制: {PADDLE_GPU_MEMORY_GB}GB / {total_gb:.1f}GB (占比 {fraction:.1%})")
+    except Exception as e:
+        print(f"[WARNING] GPU显存限制设置失败: {e}，将使用默认显存策略")
+
+
 def extract_scanned_pdf(pdf_path: str) -> List[ContentElement]:
     """使用PaddleOCR PP-StructureV3提取扫描件内容
 
@@ -290,6 +318,9 @@ def extract_scanned_pdf(pdf_path: str) -> List[ContentElement]:
     import numpy as np
 
     dpi = PDF_TYPE_DETECTION['ocr_dpi']
+
+    # 设置GPU显存限制（必须在PaddleOCR初始化前）
+    _setup_gpu_memory_limit()
 
     # 延迟导入PaddleOCR
     try:

@@ -145,4 +145,10 @@ OCR_FONT_SIZE_FACTOR = 0.8  # font_size ≈ bbox_height * 72 / dpi * factor
 # CPU模式：安装 paddlepaddle，内存占用约1.5-2GB
 # GPU模式：安装 paddlepaddle-gpu，显存占用约1-2GB，推理速度提升5-10倍
 # 支持环境变量 PADDLE_DEVICE 覆盖（Docker中使用）
-PADDLE_DEVICE = os.environ.get('PADDLE_DEVICE', 'cpu')
+PADDLE_DEVICE = os.environ.get('PADDLE_DEVICE', 'gpu')
+
+# GPU显存限制（GB）
+# 显卡共享时设置此项，限制PaddleOCR最大使用的显存
+# 设为 None 则不限制（使用全部可用显存）
+# 支持环境变量 PADDLE_GPU_MEMORY_GB 覆盖
+PADDLE_GPU_MEMORY_GB = float(os.environ.get('PADDLE_GPU_MEMORY_GB', '4')) if os.environ.get('PADDLE_GPU_MEMORY_GB') else 4

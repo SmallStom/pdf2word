@@ -1,43 +1,16 @@
 version: '3.8'
 
 # ============================================================
-# CPU模式（默认）：docker-compose up -d
-# GPU模式：docker-compose --profile gpu up -d
+# GPU模式（默认）：docker-compose up -d
+# CPU模式：docker-compose --profile cpu up -d
 # ============================================================
 
 services:
-  # ---- CPU版（默认）----
+  # ---- GPU版（默认）----
   pdf2word:
     build: .
     container_name: pdf2word
-    profiles: ["", "cpu"]
-    ports:
-      - "8000:8000"
-    environment:
-      - HOST=0.0.0.0
-      - PORT=8000
-      - HF_ENDPOINT=https://hf-mirror.com
-      - PADDLE_DEVICE=cpu
-    volumes:
-      - pdf2word_temp:/tmp/pdf2word
-    restart: unless-stopped
-    # CPU模式资源建议：至少2GB内存
-    # deploy:
-    #   resources:
-    #     limits:
-    #       memory: 4G
-    #     reservations:
-    #       memory: 2G
-
-  # ---- GPU版 ----
-  # 需要 NVIDIA Docker runtime 和 NVIDIA 驱动
-  # 启动命令: docker-compose --profile gpu up -d
-  pdf2word-gpu:
-    build:
-      context: .
-      dockerfile: Dockerfile.gpu
-    container_name: pdf2word-gpu
-    profiles: ["gpu"]
+    profiles: ["", "gpu"]
     ports:
       - "8000:8000"
     environment:
@@ -45,6 +18,8 @@ services:
       - PORT=8000
       - HF_ENDPOINT=https://hf-mirror.com
       - PADDLE_DEVICE=gpu
+      # GPU显存限制（GB），显卡共享时修改此值
+      - PADDLE_GPU_MEMORY_GB=4
     volumes:
       - pdf2word_temp:/tmp/pdf2word
     restart: unless-stopped
@@ -55,6 +30,25 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # ---- CPU版（无GPU环境使用）----
+  # 启动命令: docker-compose --profile cpu up -d
+  pdf2word-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile.cpu
+    container_name: pdf2word-cpu
+    profiles: ["cpu"]
+    ports:
+      - "8000:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - HF_ENDPOINT=https://hf-mirror.com
+      - PADDLE_DEVICE=cpu
+    volumes:
+      - pdf2word_temp:/tmp/pdf2word
+    restart: unless-stopped
 
 volumes:
   pdf2word_temp:

@@ -1,10 +1,11 @@
 # ============================================================
-# PDF转Word - CPU版Dockerfile（默认）
+# PDF转Word - GPU版Dockerfile（默认）
 # ============================================================
-# GPU版本请使用 Dockerfile.gpu
+# 需要 NVIDIA Docker runtime 和 NVIDIA 驱动
+# 显存限制通过环境变量 PADDLE_GPU_MEMORY_GB 控制（默认4GB）
 # ============================================================
 
-FROM python:3.12-slim
+FROM registry.baidubce.com/paddlepaddle/paddle:3.0.0-gpu-cuda12.0-cudnn8.9-trt8.6
 
 # ============================================================
 # 环境变量
@@ -13,15 +14,14 @@ ENV LANG=C.UTF-8 \
     LC_ALL=C.UTF-8 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    # HuggingFace镜像（国内加速）
     HF_ENDPOINT=https://hf-mirror.com \
-    # PaddleOCR模型存储路径
     PADDLE_OCR_HOME=/opt/paddleocr \
-    # Paddle运行设备：cpu
-    PADDLE_DEVICE=cpu
+    PADDLE_DEVICE=gpu \
+    # GPU显存限制（GB），显卡共享时设置此项
+    PADDLE_GPU_MEMORY_GB=4
 
 # ============================================================
-# 安装系统依赖（OpenCV等需要）
+# 安装系统依赖
 # ============================================================
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
@@ -34,14 +34,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pip.conf /etc/pip.conf
 
 # ============================================================
-# 安装Python依赖（paddlepaddle = CPU版）
+# 安装Python依赖（基础镜像已含paddlepaddle-gpu，此处安装其余依赖）
 # ============================================================
 COPY requirements.txt /app/requirements.txt
 WORKDIR /app
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir \
+    PyMuPDF pdfplumber paddleocr python-docx \
+    fastapi uvicorn python-multipart \
+    opencv-python-headless numpy Pillow
 
 # ============================================================
-# 预下载PaddleOCR模型（内置到镜像中，避免运行时下载）
+# 预下载PaddleOCR模型
 # ============================================================
 RUN mkdir -p /app/scripts
 COPY scripts/predownload_models.py /app/scripts/predownload_models.py
@@ -58,8 +61,5 @@ COPY . /app
 HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
     CMD python -c "import urllib.request; r=urllib.request.urlopen('http://localhost:8000/api/health'); exit(0 if r.status==200 else 1)"
 
-# ============================================================
-# 启动
-# ============================================================
 EXPOSE 8000
 CMD ["python", "run.py"]

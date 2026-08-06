@@ -39,6 +39,7 @@ try:
         use_chart_recognition=False,
         use_formula_recognition=True,
         use_table_recognition=True,
+        device='cpu',  # 构建时用CPU下载模型，运行时按PADDLE_DEVICE配置
     )
 
     print("\n" + "=" * 60)
