@@ -1,0 +1,29 @@
+version: '3.8'
+
+services:
+  pdf2word:
+    build: .
+    container_name: pdf2word
+    ports:
+      - "8000:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - HF_ENDPOINT=https://hf-mirror.com
+    volumes:
+      # 临时文件持久化（上传的PDF和生成的Word）
+      - pdf2word_temp:/tmp/pdf2word
+      # 如需更新模型而不重新构建镜像，取消下行注释并挂载模型目录
+      # - paddleocr_models:/opt/paddleocr
+    restart: unless-stopped
+    # 资源限制（PaddleOCR需要较多内存，建议至少2GB）
+    # deploy:
+    #   resources:
+    #     limits:
+    #       memory: 4G
+    #     reservations:
+    #       memory: 2G
+
+volumes:
+  pdf2word_temp:
+  # paddleocr_models:

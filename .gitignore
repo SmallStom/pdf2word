@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# IDE
+.trae/
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test files
+*.pdf
+*.docx
+
+# Logs
+*.log
+
+# Temp
+tmp/
+temp/
+
+# Environment
+.env
+venv/
+.venv/
+
+# Docker volumes
+paddleocr_models/

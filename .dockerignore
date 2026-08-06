@@ -1,0 +1,14 @@
+.trae/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.gitignore
+*.pdf
+*.docx
+*.log
+tmp/
+temp/
+.DS_Store
+Thumbs.db

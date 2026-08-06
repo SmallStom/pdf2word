@@ -1,0 +1,300 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PDF转Word格式规范化系统</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+            background: #f0f2f5;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .container {
+            background: #fff;
+            border-radius: 12px;
+            box-shadow: 0 4px 24px rgba(0,0,0,0.1);
+            padding: 40px;
+            width: 560px;
+            max-width: 90vw;
+        }
+        h1 {
+            font-size: 22px;
+            color: #1a1a1a;
+            margin-bottom: 8px;
+        }
+        .subtitle {
+            color: #888;
+            font-size: 14px;
+            margin-bottom: 32px;
+        }
+        .upload-zone {
+            border: 2px dashed #d0d5dd;
+            border-radius: 10px;
+            padding: 48px 24px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.2s;
+            background: #fafbfc;
+        }
+        .upload-zone:hover, .upload-zone.dragover {
+            border-color: #4a90d9;
+            background: #f0f6ff;
+        }
+        .upload-icon {
+            font-size: 40px;
+            color: #bbb;
+            margin-bottom: 12px;
+        }
+        .upload-zone p {
+            color: #666;
+            font-size: 14px;
+        }
+        .upload-zone .hint {
+            color: #aaa;
+            font-size: 12px;
+            margin-top: 6px;
+        }
+        #fileInput { display: none; }
+
+        .file-info {
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            padding: 12px 16px;
+            background: #f5f7fa;
+            border-radius: 8px;
+            margin-top: 16px;
+        }
+        .file-info.show { display: flex; }
+        .file-info .name {
+            font-size: 14px;
+            color: #333;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 340px;
+        }
+        .file-info .size {
+            color: #999;
+            font-size: 12px;
+            margin-left: 8px;
+        }
+        .file-info .remove {
+            color: #e74c3c;
+            cursor: pointer;
+            font-size: 18px;
+            margin-left: 12px;
+        }
+
+        .btn-convert {
+            width: 100%;
+            padding: 14px;
+            background: #4a90d9;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            margin-top: 24px;
+            transition: background 0.2s;
+        }
+        .btn-convert:hover { background: #3a7bc8; }
+        .btn-convert:disabled {
+            background: #bbb;
+            cursor: not-allowed;
+        }
+
+        .status {
+            display: none;
+            margin-top: 20px;
+            padding: 14px 16px;
+            border-radius: 8px;
+            font-size: 14px;
+            text-align: center;
+        }
+        .status.processing {
+            display: block;
+            background: #fff8e1;
+            color: #f57c00;
+        }
+        .status.success {
+            display: block;
+            background: #e8f5e9;
+            color: #2e7d32;
+        }
+        .status.error {
+            display: block;
+            background: #ffebee;
+            color: #c62828;
+        }
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid #f57c00;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            vertical-align: middle;
+            margin-right: 8px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        .download-btn {
+            display: none;
+            margin-top: 16px;
+            padding: 12px;
+            background: #2e7d32;
+            color: #fff;
+            text-align: center;
+            border-radius: 8px;
+            text-decoration: none;
+            font-size: 15px;
+        }
+        .download-btn.show { display: block; }
+        .download-btn:hover { background: #1b5e20; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>PDF转Word格式规范化系统</h1>
+        <p class="subtitle">上传PDF文件，自动转换为符合格式规范的Word文档</p>
+
+        <div class="upload-zone" id="uploadZone">
+            <div class="upload-icon">+</div>
+            <p>点击或拖拽PDF文件到此处上传</p>
+            <p class="hint">支持原生PDF和扫描件</p>
+        </div>
+        <input type="file" id="fileInput" accept=".pdf">
+
+        <div class="file-info" id="fileInfo">
+            <div>
+                <span class="name" id="fileName"></span>
+                <span class="size" id="fileSize"></span>
+            </div>
+            <span class="remove" id="removeBtn">&times;</span>
+        </div>
+
+        <button class="btn-convert" id="convertBtn" disabled>开始转换</button>
+
+        <div class="status" id="status"></div>
+
+        <a class="download-btn" id="downloadBtn" href="#">下载Word文档</a>
+    </div>
+
+    <script>
+        const uploadZone = document.getElementById('uploadZone');
+        const fileInput = document.getElementById('fileInput');
+        const fileInfo = document.getElementById('fileInfo');
+        const fileName = document.getElementById('fileName');
+        const fileSize = document.getElementById('fileSize');
+        const removeBtn = document.getElementById('removeBtn');
+        const convertBtn = document.getElementById('convertBtn');
+        const status = document.getElementById('status');
+        const downloadBtn = document.getElementById('downloadBtn');
+
+        let selectedFile = null;
+
+        // 点击上传区域
+        uploadZone.addEventListener('click', () => fileInput.click());
+
+        // 文件选择
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) {
+                setFile(e.target.files[0]);
+            }
+        });
+
+        // 拖拽
+        uploadZone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            uploadZone.classList.add('dragover');
+        });
+        uploadZone.addEventListener('dragleave', () => {
+            uploadZone.classList.remove('dragover');
+        });
+        uploadZone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            uploadZone.classList.remove('dragover');
+            if (e.dataTransfer.files.length > 0) {
+                const file = e.dataTransfer.files[0];
+                if (file.name.toLowerCase().endsWith('.pdf')) {
+                    setFile(file);
+                } else {
+                    showStatus('error', '请上传PDF格式文件');
+                }
+            }
+        });
+
+        function setFile(file) {
+            selectedFile = file;
+            fileName.textContent = file.name;
+            fileSize.textContent = formatSize(file.size);
+            fileInfo.classList.add('show');
+            convertBtn.disabled = false;
+            hideStatus();
+            downloadBtn.classList.remove('show');
+        }
+
+        removeBtn.addEventListener('click', () => {
+            selectedFile = null;
+            fileInput.value = '';
+            fileInfo.classList.remove('show');
+            convertBtn.disabled = true;
+            hideStatus();
+            downloadBtn.classList.remove('show');
+        });
+
+        // 转换
+        convertBtn.addEventListener('click', async () => {
+            if (!selectedFile) return;
+            convertBtn.disabled = true;
+            showStatus('processing', '<span class="spinner"></span>正在转换中，请耐心等待...');
+
+            const formData = new FormData();
+            formData.append('file', selectedFile);
+
+            try {
+                const response = await fetch('/api/convert', {
+                    method: 'POST',
+                    body: formData
+                });
+
+                if (!response.ok) {
+                    const err = await response.json();
+                    throw new Error(err.detail || '转换失败');
+                }
+
+                const blob = await response.blob();
+                const url = URL.createObjectURL(blob);
+                downloadBtn.href = url;
+                downloadBtn.download = selectedFile.name.replace(/\.pdf$/i, '.docx');
+                downloadBtn.classList.add('show');
+                showStatus('success', '转换完成！点击下方按钮下载Word文档');
+            } catch (err) {
+                showStatus('error', '转换失败：' + err.message);
+            } finally {
+                convertBtn.disabled = false;
+            }
+        });
+
+        function showStatus(type, msg) {
+            status.className = 'status ' + type;
+            status.innerHTML = msg;
+        }
+        function hideStatus() {
+            status.className = 'status';
+        }
+        function formatSize(bytes) {
+            if (bytes < 1024) return bytes + ' B';
+            if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+            return (bytes / 1048576).toFixed(1) + ' MB';
+        }
+    </script>
+</body>
+</html>
