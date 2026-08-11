@@ -42,23 +42,23 @@ class PDFToWordPipeline:
         # 0. 诊断：按 type 统计
         from collections import Counter
         type_counter = Counter(e.type for e in elements)
-        logger.info(f"[DIAG] 元素类型分布: {dict(type_counter)}")
+        print(f"[DIAG] 元素类型分布: {dict(type_counter)}", flush=True)
 
         # 0.1 诊断：非空文本元素数量
         nonempty = sum(1 for e in elements if e.text and e.text.strip())
         empty_text = sum(1 for e in elements if e.type in ('text','heading') and (not e.text or not e.text.strip()))
-        logger.info(f"[DIAG] 非空文本: {nonempty}, 空文本: {empty_text}")
+        print(f"[DIAG] 非空文本: {nonempty}, 空文本: {empty_text}", flush=True)
 
         # 0.2 诊断：前 3 个非空元素的内容样本
         samples = [e for e in elements if e.text and e.text.strip()][:3]
         for i, e in enumerate(samples):
             preview = e.text[:80].replace('\n', ' ')
-            logger.info(f"[DIAG] 样本{i+1} type={e.type} text={preview!r}")
+            print(f"[DIAG] 样本{i+1} type={e.type} text={preview!r}", flush=True)
 
         # 0.3 诊断：表格/图片数量
         tables_with_html = sum(1 for e in elements if e.type == 'table' and e.html)
         images_with_data = sum(1 for e in elements if e.type == 'image' and e.image_data)
-        logger.info(f"[DIAG] 表格(有html): {tables_with_html}, 图片(有data): {images_with_data}")
+        print(f"[DIAG] 表格(有html): {tables_with_html}, 图片(有data): {images_with_data}", flush=True)
 
         # 2. 检测正文字号基线
         body_size = detect_body_font_size(elements)

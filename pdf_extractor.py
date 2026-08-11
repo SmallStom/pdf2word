@@ -300,6 +300,10 @@ def _parse_layout_result(res, page_num: int, page_width: float,
     # ---- 路径 1：parsing_res_list（layout_parsing_v2 格式）----
     if 'parsing_res_list' in inner:
         for block in inner['parsing_res_list']:
+            # PP-StructureV3 v3 的字段名:
+            #   block_label: 'doc_title' | 'text' | 'paragraph_title' | 'table' | 'figure' | ...
+            #   block_content: 文本内容（字符串）
+            #   block_bbox: [x1, y1, x2, y2] 像素坐标
             block_type = block.get('block_label') or block.get('type', 'text')
             bbox = block.get('block_bbox') or block.get('bbox', [0, 0, 0, 0])
             if not isinstance(bbox, list) or len(bbox) != 4:
@@ -312,8 +316,11 @@ def _parse_layout_result(res, page_num: int, page_width: float,
             matched_spans = _find_spans_in_region(page_spans, pdf_bbox)
             style = _aggregate_span_style(matched_spans)
 
-            # 文本内容
-            text = block.get('text', '') or block.get('content', '')
+            # 文本内容：v3 字段是 block_content
+            text = (block.get('block_content')
+                    or block.get('content')
+                    or block.get('text')
+                    or '')
 
             if block_type in ('title', 'paragraph_title', 'heading', 'doc_title'):
                 elements.append(ContentElement(
@@ -342,18 +349,38 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                     alignment=_detect_alignment(pdf_bbox, page_width),
                 ))
             elif block_type in ('table', 'wired_table', 'wireless_table'):
-                # 表格的 HTML 在 table_res_list 里
-                html = block.get('pred_html', '') or block.get('html', '')
+                # 表格的 HTML 可能在多个字段
+                html = (block.get('pred_html')
+                        or block.get('html')
+                        or '')
                 if not html and 'table_ocr_pred' in block:
                     # 拼装简化 HTML
                     html = _build_simple_table_html(block.get('table_ocr_pred', {}))
+                # 也可能 block_content 直接是 HTML
+                if not html and text and ('<table' in text or '<tr' in text):
+                    html = text
                 if html:
                     elements.append(ContentElement(
                         type='table', text='', bbox=pdf_bbox, page_num=page_num,
                         html=html,
                     ))
+                else:
+                    # 没有 html，但有文本内容（可能是表格标题）
+                    if text:
+                        elements.append(ContentElement(
+                            type='text',
+                            text=text,
+                            bbox=pdf_bbox,
+                            page_num=page_num,
+                            font_name=style['font_name'],
+                            font_size=style['font_size'],
+                            is_bold=style['is_bold'],
+                            is_italic=style['is_italic'],
+                            alignment=_detect_alignment(pdf_bbox, page_width),
+                        ))
             elif block_type in ('figure', 'image', 'chart'):
                 # 跳过图片裁剪（PP-StructureV3 不便直接拿到原图像素）
+                # 但图名/图标题可能作为 figure_title 出现，已在上面处理
                 pass
 
     # ---- 路径 2：layout_det_res（layout_detection 格式）----
