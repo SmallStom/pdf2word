@@ -8,6 +8,11 @@
 """
 
 import os
+
+# 必须在 import paddle / paddleocr 之前设置 GPU 显存环境变量
+from pdf_extractor import _pre_setup_gpu_env
+_pre_setup_gpu_env()
+
 import uvicorn
 
 if __name__ == "__main__":

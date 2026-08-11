@@ -40,7 +40,7 @@ COPY pip.conf /etc/pip.conf
 COPY requirements.txt /app/requirements.txt
 WORKDIR /app
 RUN pip install --no-cache-dir --ignore-installed \
-    PyMuPDF pdfplumber paddleocr python-docx \
+    PyMuPDF pdfplumber paddleocr "paddlex[ocr]" python-docx \
     fastapi uvicorn python-multipart \
     opencv-python-headless numpy Pillow
 

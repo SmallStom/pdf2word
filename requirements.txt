@@ -13,6 +13,8 @@ paddlepaddle>=3.0.0
 
 # OCR
 paddleocr>=3.0.0
+# PPStructureV3 需要的额外依赖（版面分析/表格识别）
+paddlex[ocr]>=3.0.0
 
 # Word文档生成
 python-docx>=1.1.0

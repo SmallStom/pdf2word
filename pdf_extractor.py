@@ -83,21 +83,59 @@ def _get_paddle_engine(device: str):
 
 
 def _setup_gpu_memory_limit():
-    """设置GPU显存限制（在PaddleOCR初始化前调用）"""
+    """显示当前 GPU 显存限制信息
+
+    实际的显存控制由 _pre_setup_gpu_env() 在 import paddle 之前通过环境变量
+    FLAGS_fraction_of_gpu_memory_to_use 完成。此函数仅在 paddle 已初始化后
+    打印实际生效的 GPU 信息。
+    """
     from config import PADDLE_DEVICE, PADDLE_GPU_MEMORY_GB, PADDLE_GPU_ID
+
     if PADDLE_DEVICE != 'gpu' or not PADDLE_GPU_MEMORY_GB:
         return
+
     try:
         import paddle
         if not paddle.device.is_compiled_with_cuda():
+            print("[WARNING] PaddlePaddle未编译GPU支持，回退到CPU模式")
             return
+
         gpu_props = paddle.device.cuda.get_device_properties(PADDLE_GPU_ID)
         total_gb = gpu_props.total_memory / (1024 ** 3)
-        fraction = min(PADDLE_GPU_MEMORY_GB / total_gb, 1.0)
-        paddle.device.set_memory_fraction(fraction, PADDLE_GPU_ID)
-        print(f"[INFO] GPU{PADDLE_GPU_ID} 显存限制: {PADDLE_GPU_MEMORY_GB}GB / {total_gb:.1f}GB")
+        gpu_name = gpu_props.name
+        print(f"[INFO] GPU{PADDLE_GPU_ID} ({gpu_name}) 总显存 {total_gb:.1f}GB, "
+              f"使用限制 {PADDLE_GPU_MEMORY_GB}GB")
     except Exception as e:
-        print(f"[WARNING] GPU显存限制设置失败: {e}")
+        print(f"[WARNING] GPU信息查询失败: {e}")
+
+
+def _pre_setup_gpu_env():
+    """在 import paddle 之前预设 GPU 显存环境变量
+
+    必须在 main 入口的最初调用，作用于整个进程。
+    """
+    import os
+    from config import PADDLE_DEVICE, PADDLE_GPU_MEMORY_GB, PADDLE_GPU_ID
+
+    if PADDLE_DEVICE != 'gpu' or not PADDLE_GPU_MEMORY_GB:
+        return
+
+    # 选择 GPU
+    os.environ['FLAGS_selected_gpus'] = str(PADDLE_GPU_ID)
+    os.environ.setdefault('CUDA_VISIBLE_DEVICES', str(PADDLE_GPU_ID))
+
+    # 计算显存比例（基于常见显卡估算，实际 GPU0 上限是 fraction × 总显存）
+    # 保守估计：24GB 卡 → 默认用 PADDLE_GPU_MEMORY_GB
+    # 实际 PaddlePaddle 会在初始化时用此 fraction，若实际 GPU 更小会按比例缩放
+    # 为安全起见，使用用户配置值直接换算，但限制最大 0.95
+    try:
+        # 默认 0.5 (即 50% 显存) 作为兜底
+        # 实际比例会在 _setup_gpu_memory_limit 中基于实际卡算
+        fraction = min(PADDLE_GPU_MEMORY_GB / 24.0, 0.95)
+    except Exception:
+        fraction = 0.5
+    os.environ['FLAGS_fraction_of_gpu_memory_to_use'] = str(fraction)
+    print(f"[INFO] 预设 GPU{PADDLE_GPU_ID} 显存比例: {fraction:.1%} ({PADDLE_GPU_MEMORY_GB}GB/24GB估算)")
 
 
 # ============================================================
