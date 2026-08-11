@@ -5,7 +5,7 @@
 # 显存限制通过环境变量 PADDLE_GPU_MEMORY_GB 控制（默认4GB）
 # ============================================================
 
-FROM registry.baidubce.com/paddlepaddle/paddle:3.0.0-gpu-cuda12.0-cudnn8.9-trt8.6
+FROM ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddle:3.0.0-gpu-cuda11.8-cudnn8.9-trt8.6
 
 # ============================================================
 # 环境变量
