@@ -75,9 +75,13 @@ def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]
             layout_level = 1  # 默认 1 级
 
     # ---- 信号3：字号判断 ----
+    # 关键：仅当字号 >= body_size + 1pt 时才可能是标题
     size_level = None
     if font_size and font_size > 0:
-        if font_size >= 18:
+        if body_size > 0 and font_size <= body_size + 0.5:
+            # 字号与正文相当 → 不是标题
+            size_level = None
+        elif font_size >= 18:
             size_level = 1
         elif font_size >= 15:
             size_level = 2
@@ -87,17 +91,22 @@ def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]
             size_level = 4
 
     # ---- 信号4：加粗+字号大于正文 ----
+    # 关键：仅当字号 > 正文时才可能是标题；加粗但字号 < 正文是普通加粗正文
     bold_level = None
     if is_bold and body_size > 0 and font_size:
-        ratio = font_size / body_size
-        if ratio >= 1.3:
-            bold_level = 1
-        elif ratio >= 1.15:
-            bold_level = 2
-        elif ratio >= 1.05:
-            bold_level = 3
+        if font_size <= body_size:
+            # 字号 <= 正文：加粗的正文，不是标题
+            bold_level = None
         else:
-            bold_level = 4
+            ratio = font_size / body_size
+            if ratio >= 1.3:
+                bold_level = 1
+            elif ratio >= 1.15:
+                bold_level = 2
+            elif ratio >= 1.05:
+                bold_level = 3
+            else:
+                bold_level = None  # 字号接近正文，不算标题
 
     # ---- 融合决策 ----
     # 文本模式最可靠，直接用
