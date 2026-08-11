@@ -36,7 +36,7 @@ COPY pip.conf /etc/pip.conf
 # ============================================================
 COPY requirements.txt /app/requirements.txt
 WORKDIR /app
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --ignore-installed -r requirements.txt
 
 # ============================================================
 # 预下载PaddleOCR模型

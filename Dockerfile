@@ -35,10 +35,11 @@ COPY pip.conf /etc/pip.conf
 
 # ============================================================
 # 安装Python依赖（基础镜像已含paddlepaddle-gpu，此处安装其余依赖）
+# 基础镜像预装了PyYAML等老版本distutils包，使用 --ignore-installed 强制覆盖
 # ============================================================
 COPY requirements.txt /app/requirements.txt
 WORKDIR /app
-RUN pip install --no-cache-dir \
+RUN pip install --no-cache-dir --ignore-installed \
     PyMuPDF pdfplumber paddleocr python-docx \
     fastapi uvicorn python-multipart \
     opencv-python-headless numpy Pillow
