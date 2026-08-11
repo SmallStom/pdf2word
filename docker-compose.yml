@@ -30,6 +30,8 @@ services:
       - PADDLE_GPU_MEMORY_GB=4
     volumes:
       - pdf2word_temp:/tmp/pdf2word
+      # PaddleX 模型缓存（避免每次重新构建镜像都要重新下载模型）
+      - pdf2word_models:/root/.paddlex
     restart: unless-stopped
     deploy:
       resources:
@@ -56,7 +58,9 @@ services:
       - PADDLE_DEVICE=cpu
     volumes:
       - pdf2word_temp:/tmp/pdf2word
+      - pdf2word_models:/root/.paddlex
     restart: unless-stopped
 
 volumes:
   pdf2word_temp:
+  pdf2word_models:

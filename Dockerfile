@@ -45,11 +45,14 @@ RUN pip install --no-cache-dir --ignore-installed \
     opencv-python-headless numpy Pillow
 
 # ============================================================
-# 预下载PaddleOCR模型
+# 预下载PaddleX模型（写到镜像层 ~/.paddlex/official_models/）
+# 注意：运行时若挂载了 pdf2word_models 卷到 /root/.paddlex，此处下载的
+# 模型会被卷覆盖（首次启动会重新下载到卷中）。此步骤主要是为了
+# 让"无卷"场景（如开发调试）也能直接用。
 # ============================================================
 RUN mkdir -p /app/scripts
 COPY scripts/predownload_models.py /app/scripts/predownload_models.py
-RUN python scripts/predownload_models.py
+RUN python scripts/predownload_models.py || echo "模型预下载失败（不影响构建）"
 
 # ============================================================
 # 复制应用代码

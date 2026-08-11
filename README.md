@@ -31,7 +31,7 @@ docker-compose up -d
 # 访问 http://localhost:8000
 ```
 
-首次构建会预下载 PaddleOCR 模型（约 200MB），后续启动秒级就绪。
+首次启动会自动从百度云下载 PaddleX 模型（约 1-2GB，需 5-15 分钟），后续启动秒级就绪。
 
 ### 本地运行
 
@@ -70,7 +70,7 @@ pdf2word/
 ├── static/
 │   └── index.html              # Web 上传/下载页面
 ├── scripts/
-│   └── predownload_models.py   # PaddleOCR 模型预下载脚本
+│   └── predownload_models.py   # PaddleX 模型预下载脚本（build 阶段）
 ├── Dockerfile                  # Docker 镜像构建
 ├── docker-compose.yml          # Docker Compose 编排
 ├── pip.conf                    # pip 清华镜像源配置
@@ -157,6 +157,26 @@ docker-compose up -d
 # 方式二：手动构建
 docker build -t pdf2word .
 docker run -d -p 8000:8000 --name pdf2word pdf2word
+```
+
+### 模型缓存（命名卷）
+
+PaddleX 模型默认缓存在 `~/.paddlex/official_models/`，**docker-compose.yml 已挂载为命名卷 `pdf2word_models`**，避免每次重建镜像都重新下载（约 1-2GB）。
+
+- **首次启动**：容器内检测到卷是空的，会自动从百度云下载模型到卷中（约 5-15 分钟）
+- **后续启动**：直接复用卷中的模型，秒级就绪
+- **重建镜像**：`docker-compose build --no-cache` 不会影响模型卷，模型不丢
+
+```bash
+# 查看模型卷大小
+docker volume inspect pdf2word_pdf2word_models
+
+# 备份/迁移模型卷到其他机器
+docker run --rm -v pdf2word_pdf2word_models:/from -v $(pwd):/to \
+    alpine tar czf /to/pdf2word_models.tar.gz -C /from .
+
+# 删除模型卷（下次启动会重新下载）
+docker volume rm pdf2word_pdf2word_models
 ```
 
 ### 环境变量
