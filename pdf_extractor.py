@@ -322,6 +322,10 @@ def _parse_layout_result(res, page_num: int, page_width: float,
             matched_spans = _find_spans_in_region(page_spans, pdf_bbox)
             style = _aggregate_span_style(matched_spans)
 
+            # 对齐方式：优先 block 自带，再 span 位置检测
+            alignment = _extract_block_alignment(block) \
+                or _detect_alignment(pdf_bbox, page_width, matched_spans)
+
             # 文本内容：v3 字段是 block_content
             text = (block.get('block_content')
                     or block.get('content')
@@ -352,7 +356,7 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                     font_size=style['font_size'],
                     is_bold=style['is_bold'],
                     is_italic=style['is_italic'],
-                    alignment=_detect_alignment(pdf_bbox, page_width),
+                    alignment=alignment,
                 ))
             elif block_type in ('text', 'paragraph', 'content', 'reference',
                                  'abstract', 'algorithm', 'header', 'footer',
@@ -366,7 +370,7 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                     font_size=style['font_size'],
                     is_bold=style['is_bold'],
                     is_italic=style['is_italic'],
-                    alignment=_detect_alignment(pdf_bbox, page_width),
+                    alignment=alignment,
                 ))
             elif block_type in ('table', 'wired_table', 'wireless_table'):
                 # 表格的 HTML 可能在多个字段
@@ -396,7 +400,7 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                             font_size=style['font_size'],
                             is_bold=style['is_bold'],
                             is_italic=style['is_italic'],
-                            alignment=_detect_alignment(pdf_bbox, page_width),
+                            alignment=alignment,
                         ))
             elif block_type in ('figure', 'image', 'chart'):
                 # 跳过图片裁剪（PP-StructureV3 不便直接拿到原图像素）
@@ -415,6 +419,8 @@ def _parse_layout_result(res, page_num: int, page_width: float,
             matched_spans = _find_spans_in_region(page_spans, pdf_bbox)
             style = _aggregate_span_style(matched_spans)
             text = box.get('text', '')
+            box_alignment = _extract_block_alignment(box) \
+                or _detect_alignment(pdf_bbox, page_width, matched_spans)
 
             if label in ('title', 'paragraph_title', 'heading', 'doc_title'):
                 t = 'heading'
@@ -431,7 +437,7 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                 type=t, text=text, bbox=pdf_bbox, page_num=page_num,
                 font_name=style['font_name'], font_size=style['font_size'],
                 is_bold=style['is_bold'], is_italic=style['is_italic'],
-                alignment=_detect_alignment(pdf_bbox, page_width),
+                alignment=box_alignment,
             )
             elements.append(elem)
 
@@ -536,19 +542,91 @@ def _aggregate_span_style(spans: List[Dict]) -> Dict:
     }
 
 
-def _detect_alignment(bbox, page_width) -> str:
-    """根据bbox位置检测对齐方式"""
+def _detect_alignment(bbox, page_width, spans: List[Dict] = None) -> str:
+    """根据 bbox + 内部 span 位置 检测对齐方式
+
+    算法（更可靠）：
+    1. 如果传了 spans，用所有 span 的 left/right 中位数算对齐
+       - 文本居中：左右边距大致相等
+       - 文本左对齐：左 margin 小，右 margin 大
+       - 文本右对齐：左 margin 大，右 margin 小
+    2. 否则用 bbox 粗略判断
+    """
+    if spans:
+        return _detect_alignment_from_spans(spans, page_width)
+
     x1, y1, x2, y2 = bbox
     left = x1
     right = page_width - x2
     elem_width = x2 - x1
 
-    if abs(left - right) < 50 and elem_width < page_width * 0.8:
+    # 容差：左右 margin 相差 < 5% 页宽 算居中
+    tol = page_width * 0.05
+    if abs(left - right) < tol and elem_width < page_width * 0.85:
         return 'center'
-    elif right < 50 and left > 100:
+    elif right < tol and left > tol:
         return 'right'
     else:
         return 'left'
+
+
+def _detect_alignment_from_spans(spans: List[Dict], page_width: float) -> str:
+    """用 span 实际位置判断对齐（更精确）
+
+    spans 是 PyMuPDF 抽出的 span 列表，每条带 'bbox' [x1, y1, x2, y2]
+    """
+    if not spans:
+        return 'left'
+
+    # 取所有 span 的左边界和右边界
+    lefts = [s['bbox'][0] for s in spans]
+    rights = [s['bbox'][2] for s in spans]
+    # 用最左和最右（最保守的检测）
+    min_left = min(lefts)
+    max_right = max(rights)
+
+    left_margin = min_left
+    right_margin = page_width - max_right
+
+    # 容差：5% 页宽 = 约 30pt
+    tol = page_width * 0.05
+
+    if abs(left_margin - right_margin) < tol:
+        return 'center'
+    elif right_margin < tol and left_margin > tol:
+        return 'right'
+    else:
+        return 'left'
+
+
+def _extract_block_alignment(block: Dict) -> Optional[str]:
+    """从 PP-StructureV3 的 block 字段直接读 alignment
+
+    v3 的 block 可能含 'text_align' / 'align' / 'alignment' 字段
+    """
+    if not block:
+        return None
+    for key in ('text_align', 'align', 'alignment', 'horizontal_alignment'):
+        val = block.get(key)
+        if val is None:
+            continue
+        if isinstance(val, str):
+            val_lower = val.lower()
+            if val_lower in ('center', 'centre', 'middle', '居中'):
+                return 'center'
+            if val_lower in ('right', 'right_align', '右对齐'):
+                return 'right'
+            if val_lower in ('left', 'left_align', '左对齐'):
+                return 'left'
+        elif isinstance(val, (int, float)):
+            # 一些模型用 0=left, 1=center, 2=right
+            if val == 1:
+                return 'center'
+            elif val == 2:
+                return 'right'
+            elif val == 0:
+                return 'left'
+    return None
 
 
 # ============================================================

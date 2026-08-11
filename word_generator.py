@@ -305,11 +305,12 @@ def add_body_paragraph(doc: Document, text: str, size_pt: float = None,
 # ============================================================
 # 标题段落
 # ============================================================
-def add_heading(doc: Document, text: str, level: int):
+def add_heading(doc: Document, text: str, level: int, alignment: str = 'left'):
     """添加标题段落
 
     使用 Word 原生 Heading 1/2/3 样式（支持大纲/目录/导航）
     宋体加粗，按层级设置字号（16/15/14/12pt）
+    alignment: 'left' / 'center' / 'right'（按 PDF 实际位置推断）
     """
     # 使用 Word 原生 Heading 样式，让 Word 知道这是标题
     # 这样 Word 的大纲视图、目录生成、导航窗格都能识别
@@ -349,7 +350,13 @@ def add_heading(doc: Document, text: str, level: int):
                            space_before=0,
                            space_after=0,
                            snap_to_grid=False)
-    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    # 标题对齐：按 PDF 实际位置
+    if alignment == 'center':
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    elif alignment == 'right':
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    else:
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
 
 # ============================================================
@@ -585,9 +592,10 @@ def generate_word(elements: List[ContentElement], output_path: str):
         if elem.type == 'heading':
             # 更新章节号
             counter.update_chapter(elem.text, elem.heading_level or 1)
-            # 添加标题
+            # 添加标题（传 alignment 保持 PDF 原版位置）
             if elem.text and elem.text.strip():
-                add_heading(doc, elem.text, elem.heading_level or 1)
+                add_heading(doc, elem.text, elem.heading_level or 1,
+                            alignment=elem.alignment or 'left')
                 added_counts['heading'] += 1
 
         elif elem.type == 'table':
