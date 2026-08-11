@@ -167,6 +167,12 @@ def extract_with_layout_analysis(pdf_path: str, dpi: int = 200) -> List[ContentE
     total_pages = len(doc)
     print(f"[EXT-2] PDF opened, {total_pages} pages", flush=True)
 
+    # 限制最大处理页数（用于快速验证/调试）
+    from config import MAX_PAGES
+    if MAX_PAGES and MAX_PAGES > 0 and total_pages > MAX_PAGES:
+        print(f"[EXT-2] MAX_PAGES={MAX_PAGES} 限制生效，只处理前 {MAX_PAGES} 页（总 {total_pages} 页）", flush=True)
+        total_pages = MAX_PAGES
+
     # 临时目录存放每页的 PNG
     tmp_dir = tempfile.mkdtemp(prefix='pdf2word_')
     logger.info(f"[INFO] 临时目录: {tmp_dir}")

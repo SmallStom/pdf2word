@@ -160,3 +160,8 @@ PADDLE_GPU_ID = int(os.environ.get('PADDLE_GPU_ID', '0'))
 # 设为 None 则不限制（使用全部可用显存）
 # 支持环境变量 PADDLE_GPU_MEMORY_GB 覆盖
 PADDLE_GPU_MEMORY_GB = float(os.environ.get('PADDLE_GPU_MEMORY_GB', '4')) if os.environ.get('PADDLE_GPU_MEMORY_GB') else 4
+
+# 最大处理页数（用于快速验证/调试）
+# 设为 None 处理全部页面；设为 N 表示只处理前 N 页
+# 通过环境变量 MAX_PAGES 配置，例如：MAX_PAGES=10
+MAX_PAGES = int(os.environ.get('MAX_PAGES', '0')) if os.environ.get('MAX_PAGES') else None
