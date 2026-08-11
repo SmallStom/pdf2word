@@ -159,24 +159,24 @@ docker build -t pdf2word .
 docker run -d -p 8000:8000 --name pdf2word pdf2word
 ```
 
-### 模型缓存（命名卷）
+### 模型缓存（绑定挂载）
 
-PaddleX 模型默认缓存在 `~/.paddlex/official_models/`，**docker-compose.yml 已挂载为命名卷 `pdf2word_models`**，避免每次重建镜像都重新下载（约 1-2GB）。
+PaddleX 模型默认缓存在 `~/.paddlex/official_models/`，**docker-compose.yml 已绑定挂载到当前目录的 `./.models/` 子目录**（不是命名卷），这样可以直接 `ls` 看到、备份、删除。
 
-- **首次启动**：容器内检测到卷是空的，会自动从百度云下载模型到卷中（约 5-15 分钟）
-- **后续启动**：直接复用卷中的模型，秒级就绪
-- **重建镜像**：`docker-compose build --no-cache` 不会影响模型卷，模型不丢
+- **首次启动**：容器内检测到 `./.models/` 为空，会自动从百度云下载模型到 `./.models/`（约 1-2GB，需 5-15 分钟）
+- **后续启动**：直接复用 `./.models/` 中的模型，秒级就绪
+- **重建镜像**：`docker-compose build --no-cache` 不会影响 `./.models/`，模型不丢
+- **迁移到其他机器**：直接 `scp -r ./.models/ user@new-server:/path/`
 
 ```bash
-# 查看模型卷大小
-docker volume inspect pdf2word_pdf2word_models
+# 查看模型缓存大小
+du -sh ./.models/
 
-# 备份/迁移模型卷到其他机器
-docker run --rm -v pdf2word_pdf2word_models:/from -v $(pwd):/to \
-    alpine tar czf /to/pdf2word_models.tar.gz -C /from .
+# 删除模型（下次启动会重新下载）
+rm -rf ./.models/
 
-# 删除模型卷（下次启动会重新下载）
-docker volume rm pdf2word_pdf2word_models
+# 把 .models/ 加入 .gitignore（已默认忽略）
+# 见 .gitignore
 ```
 
 ### 环境变量
