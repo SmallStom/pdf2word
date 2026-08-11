@@ -75,20 +75,20 @@ def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]
             layout_level = 1  # 默认 1 级
 
     # ---- 信号3：字号判断 ----
-    # 关键：仅当字号 >= body_size + 1pt 时才可能是标题
+    # 关键：仅当字号 >= 15pt 且加粗时才判 heading
+    # 14pt 加粗（如"1. 招标条件"列表大项）不算 heading（太接近正文）
     size_level = None
-    if font_size and font_size > 0:
+    if font_size and font_size > 0 and is_bold:
         if body_size > 0 and font_size <= body_size + 0.5:
             # 字号与正文相当 → 不是标题
             size_level = None
         elif font_size >= 18:
             size_level = 1
-        elif font_size >= 15:
+        elif font_size >= 16:
             size_level = 2
-        elif font_size >= 14:
+        elif font_size >= 15:
             size_level = 3
-        elif font_size >= 13 and (is_bold or (body_size > 0 and font_size > body_size * 1.05)):
-            size_level = 4
+        # 14pt 加粗不算 heading（"1. 招标条件" 这种列表项的典型字号）
 
     # ---- 信号4：加粗+字号大于正文 ----
     # 关键：仅当字号 > 正文时才可能是标题；加粗但字号 < 正文是普通加粗正文

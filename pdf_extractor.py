@@ -351,7 +351,11 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                 text=text, block_label=block_type, block=block
             )
 
-            if block_type in ('title', 'paragraph_title', 'heading', 'doc_title'):
+            # 关键：只有真正的"文档标题"才强制 type=heading（如"招标文件"封面大字）
+            # "paragraph_title" 是 PP-StructureV3 对"段落小标题"的判断
+            # 但它经常误把"1. 招标条件"这种大编号列表项当 paragraph_title
+            # 所以 paragraph_title 不强制 heading，让 style_mapper 二次判断
+            if block_type in ('title', 'doc_title', 'heading'):
                 elements.append(ContentElement(
                     type='heading',
                     text=text,
@@ -365,7 +369,8 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                 ))
             elif block_type in ('text', 'paragraph', 'content', 'reference',
                                  'abstract', 'algorithm', 'header', 'footer',
-                                 'figure_title', 'table_title'):
+                                 'figure_title', 'table_title',
+                                 'paragraph_title'):  # 让 paragraph_title 走 text 路径，由 style_mapper 判断
                 elements.append(ContentElement(
                     type='text',
                     text=text,
@@ -483,16 +488,42 @@ def _extract_page_spans(page) -> List[Dict]:
                 if not text.strip():
                     continue
                 flags = span.get("flags", 0)
+                font_name = span.get("font", "")
+                # 加粗检测：
+                # 1. PyMuPDF flags bit 16 (粗体)
+                # 2. 字体名含 "Bold" / "Heavy" / "Black" / 中文 "粗" "黑" "加粗"
+                is_bold = bool(flags & 16) or _is_bold_font_name(font_name)
+                is_italic = bool(flags & 2) or 'italic' in font_name.lower() or '斜' in font_name
                 spans.append({
                     'text': text,
                     'bbox': list(span.get("bbox", [0, 0, 0, 0])),
-                    'font': span.get("font", ""),
+                    'font': font_name,
                     'size': float(span.get("size", 0)),
                     'flags': flags,
-                    'is_bold': bool(flags & 16),
-                    'is_italic': bool(flags & 2),
+                    'is_bold': is_bold,
+                    'is_italic': is_italic,
                 })
     return spans
+
+
+def _is_bold_font_name(font_name: str) -> bool:
+    """从字体名识别粗体
+
+    例如：
+    - "SimSun-Bold" / "SimHei" / "黑体" → True
+    - "FangSong" / "仿宋" / "KaiTi" → False
+    - "TimesNewRomanPS-BoldMT" → True
+    """
+    if not font_name:
+        return False
+    name = font_name.lower()
+    bold_indicators = ['bold', 'heavy', 'black', 'demibold', 'semibold', 'mediumbold']
+    cn_bold_indicators = ['粗', '黑', '加粗']
+    if any(ind in name for ind in bold_indicators):
+        return True
+    if any(ind in font_name for ind in cn_bold_indicators):
+        return True
+    return False
 
 
 def _find_spans_in_region(spans: List[Dict], region_bbox: List[float],
@@ -646,15 +677,13 @@ def _align_from_label(block_label: str = None) -> Optional[str]:
 
     只在结构明确时判 center：
     - doc_title / figure_title / table_title / reference_title / algorithm_title
-    - paragraph_title（一级章节标题如"第三章 评标办法..."）
-    其他 label 不强行判（避免把正文误判居中）
+    其他 label（包括 paragraph_title）不强行判（避免把正文误判居中）
     """
     if not block_label:
         return None
     label_lower = block_label.lower()
-    # 几乎都居中的类型
     if label_lower in ('doc_title', 'figure_title', 'table_title',
-                        'reference_title', 'algorithm_title', 'paragraph_title'):
+                        'reference_title', 'algorithm_title'):
         return 'center'
     return None
 
