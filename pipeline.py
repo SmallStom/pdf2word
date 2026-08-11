@@ -66,7 +66,8 @@ class PDFToWordPipeline:
                 # 这是疑似"列表项"段落
                 print(
                     f"[DIAG-LIST] i={i} type={e.type} font_size={e.font_size} "
-                    f"is_bold={e.is_bold} alignment={e.alignment} text={t[:60]!r}",
+                    f"font_name={e.font_name!r} is_bold={e.is_bold} "
+                    f"alignment={e.alignment} text={t[:60]!r}",
                     flush=True
                 )
 

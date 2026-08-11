@@ -83,9 +83,10 @@ HEADING_PATTERNS = [
 BODY_FONT = {
     'cn': '宋体',
     'en': 'Times New Roman',
-    'size_pt': 12,          # 小四号
+    'size_pt': 12,          # 小四号（默认）
     'bold': False,
-    'line_spacing': 1.5,    # 1.5倍行距
+    # 实际 PDF 招标文件行距约单倍（字体 10.4pt + 行间 gap 约 10pt）
+    'line_spacing': 1.0,
     'space_before_pt': 0,
     'space_after_pt': 0,
     'first_line_indent_chars': 2,  # 首行缩进2字符
