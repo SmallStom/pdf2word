@@ -39,11 +39,13 @@ async def index():
 
 
 @app.post("/api/convert")
-async def convert_pdf(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
+async def convert_pdf(file: UploadFile = File(...)):
     """上传PDF并转换为Word
 
     接收PDF文件，自动检测类型（原生/扫描），提取内容并按格式规范生成Word文档。
     """
+    import sys
+    print(f"[APP-0] /api/convert called, file={file.filename}", flush=True)
     # 验证文件类型
     if not file.filename or not file.filename.lower().endswith('.pdf'):
         raise HTTPException(status_code=400, detail="请上传PDF格式文件")
@@ -52,19 +54,28 @@ async def convert_pdf(file: UploadFile = File(...), background_tasks: Background
     pdf_id = str(uuid.uuid4())
     pdf_path = str(TEMP_DIR / f"{pdf_id}.pdf")
     docx_path = str(TEMP_DIR / f"{pdf_id}.docx")
+    print(f"[APP-1] pdf_id={pdf_id}, paths set", flush=True)
 
     try:
         content = await file.read()
         with open(pdf_path, 'wb') as f:
             f.write(content)
         logger.info(f"已保存上传文件: {file.filename} ({len(content)} bytes)")
+        print(f"[APP-2] PDF saved, {len(content)} bytes", flush=True)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"文件保存失败: {str(e)}")
 
-    # 执行转换
+    # 执行转换（在子线程中运行，避免阻塞event loop）
+    import asyncio
+    import functools
+    print(f"[APP-3] dispatching to thread", flush=True)
     try:
-        pipeline = PDFToWordPipeline()
-        pipeline.process(pdf_path, docx_path)
+        await asyncio.to_thread(
+            _run_pipeline,
+            pdf_path, docx_path,
+        )
+        print(f"[APP-4] pipeline returned, docx exists={os.path.exists(docx_path)}, "
+              f"size={os.path.getsize(docx_path) if os.path.exists(docx_path) else 0}", flush=True)
     except ImportError as e:
         _cleanup_file(pdf_path)
         _cleanup_file(docx_path)
@@ -81,16 +92,27 @@ async def convert_pdf(file: UploadFile = File(...), background_tasks: Background
     # 生成输出文件名
     output_filename = file.filename.rsplit('.', 1)[0] + '.docx'
 
-    # 注册清理任务（响应发送后执行）
-    if background_tasks:
-        background_tasks.add_task(_cleanup_file, pdf_path)
-        background_tasks.add_task(_cleanup_file, docx_path)
+    print(f"[APP-5] returning FileResponse, output={output_filename}", flush=True)
 
     return FileResponse(
         path=docx_path,
         filename=output_filename,
         media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        background=None,  # 不在响应后清理文件，由 _run_pipeline 完成
     )
+
+
+def _run_pipeline(pdf_path: str, docx_path: str):
+    """同步函数：在子线程中运行 pipeline 流程
+
+    完成后清理输入PDF，保留输出docx（FileResponse需要）。
+    """
+    try:
+        pipeline = PDFToWordPipeline()
+        pipeline.process(pdf_path, docx_path)
+    finally:
+        # 清理输入PDF，docx 留给 FileResponse 发送
+        _cleanup_file(pdf_path)
 
 
 @app.get("/api/health")

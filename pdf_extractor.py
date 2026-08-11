@@ -97,19 +97,25 @@ _PP_STRUCTURE_ENGINE = None
 
 def _get_paddle_engine(device: str):
     """获取或创建 PP-StructureV3 引擎（单例）"""
+    import sys
     global _PP_STRUCTURE_ENGINE
+    print(f"[ENGINE-0] _get_paddle_engine called, device={device}, existing={_PP_STRUCTURE_ENGINE is not None}", flush=True)
     if _PP_STRUCTURE_ENGINE is not None:
         return _PP_STRUCTURE_ENGINE
 
     from config import PADDLE_GPU_ID, PADDLE_DEVICE
+    print(f"[ENGINE-1] printing GPU info", flush=True)
     _print_gpu_info()
+    print(f"[ENGINE-1] GPU info printed", flush=True)
 
     try:
         from paddleocr import PPStructureV3
+        print(f"[ENGINE-2] PPStructureV3 imported", flush=True)
     except ImportError as e:
+        print(f"[ENGINE-2] import FAILED: {e}", flush=True)
         raise ImportError("未安装 paddleocr，请运行: pip install paddleocr") from e
 
-    logger.info(f"[INFO] 初始化 PP-StructureV3 (device={device})...")
+    print(f"[ENGINE-3] initializing PPStructureV3 (this may take minutes on first run)...", flush=True)
     _PP_STRUCTURE_ENGINE = PPStructureV3(
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
@@ -122,6 +128,7 @@ def _get_paddle_engine(device: str):
         lang='ch',
         device=device,
     )
+    print(f"[ENGINE-3] PPStructureV3 initialized", flush=True)
     logger.info("[INFO] PP-StructureV3 初始化完成")
     return _PP_STRUCTURE_ENGINE
 
@@ -144,14 +151,21 @@ def extract_with_layout_analysis(pdf_path: str, dpi: int = 200) -> List[ContentE
     3. PP-StructureV3.predict() 对图像做版面分析
     4. 把 result 转成 ContentElement
     """
+    import sys
     from config import PADDLE_DEVICE, PADDLE_GPU_ID
 
+    print(f"[EXT-0] extract_with_layout_analysis entered: {pdf_path}, dpi={dpi}", flush=True)
+    print(f"[EXT-0] PADDLE_DEVICE={PADDLE_DEVICE}, PADDLE_GPU_ID={PADDLE_GPU_ID}", flush=True)
+
     device = f'gpu:{PADDLE_GPU_ID}' if PADDLE_DEVICE == 'gpu' else 'cpu'
+    print(f"[EXT-1] creating engine with device={device}", flush=True)
     engine = _get_paddle_engine(device)
+    print(f"[EXT-1] engine ready", flush=True)
 
     doc = fitz.open(pdf_path)
     elements: List[ContentElement] = []
     total_pages = len(doc)
+    print(f"[EXT-2] PDF opened, {total_pages} pages", flush=True)
 
     # 临时目录存放每页的 PNG
     tmp_dir = tempfile.mkdtemp(prefix='pdf2word_')

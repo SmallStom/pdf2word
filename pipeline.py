@@ -24,12 +24,16 @@ class PDFToWordPipeline:
     """PDF转规范Word完整流水线"""
 
     def process(self, pdf_path: str, output_path: str) -> str:
+        import sys
+        print(f"[STAGE 0] process() entered, pdf={pdf_path}", flush=True)
         if not os.path.exists(pdf_path):
+            print(f"[STAGE 0] PDF file not found!", flush=True)
             raise FileNotFoundError(f"PDF文件不存在: {pdf_path}")
 
-        # 1. 版面分析（PP-StructureV3 统一处理原生/扫描件）
+        print(f"[STAGE 1] calling extract_with_layout_analysis", flush=True)
         logger.info("开始 PP-StructureV3 版面分析...")
         elements = extract_with_layout_analysis(pdf_path, dpi=200)
+        print(f"[STAGE 1] returned with {len(elements)} elements", flush=True)
         logger.info(f"提取到 {len(elements)} 个内容元素")
 
         if not elements:
