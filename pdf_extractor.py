@@ -1,19 +1,22 @@
 # -*- coding: utf-8 -*-
-"""PDF内容提取模块 - 基于 PP-StructureV3 版面分析的统一提取
+"""PDF内容提取模块 - 基于 PP-StructureV3 版面分析
 
-策略：
-- 所有 PDF 都通过 PP-StructureV3 做版面分析（title/text/table/figure）
-- 同时用 PyMuPDF 提取每页的精细 span 信息（字体名/字号/粗斜体）
-- 将两者结果按空间位置合并：版面区域给出"是什么"，PyMuPDF 给出"长什么样"
-- 原生 PDF 和扫描件走同一条路径，仅 PDF→图片 时使用的 DPI 不同（影响 OCR 精度/速度）
+每页用 PyMuPDF 渲染成临时 PNG，传给 PP-StructureV3.predict() 做版面分析，
+然后从 LayoutParsingResultV2 提取结构化信息。
 """
 
+import os
 import re
 import io
+import time
+import tempfile
+import logging
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple
 
 import fitz  # PyMuPDF
+
+logger = logging.getLogger(__name__)
 
 
 # ============================================================
@@ -42,11 +45,52 @@ class ContentElement:
     # 后处理填充
     heading_level: Optional[int] = None
     mapped_size: Optional[float] = None
-    alignment: Optional[str] = None  # 'left', 'center', 'right'
+    alignment: Optional[str] = None
 
 
 # ============================================================
-# PP-StructureV3 模型初始化（延迟加载，避免导入即报错）
+# GPU 环境预设（必须在 import paddle 之前）
+# ============================================================
+def _pre_setup_gpu_env():
+    """在 import paddle 之前预设 GPU 显存环境变量"""
+    import os
+    from config import PADDLE_DEVICE, PADDLE_GPU_MEMORY_GB, PADDLE_GPU_ID
+
+    if PADDLE_DEVICE != 'gpu' or not PADDLE_GPU_MEMORY_GB:
+        return
+
+    os.environ['FLAGS_selected_gpus'] = str(PADDLE_GPU_ID)
+    os.environ.setdefault('CUDA_VISIBLE_DEVICES', str(PADDLE_GPU_ID))
+
+    # 保守估算：按 24GB 卡算
+    try:
+        fraction = min(PADDLE_GPU_MEMORY_GB / 24.0, 0.95)
+    except Exception:
+        fraction = 0.5
+    os.environ['FLAGS_fraction_of_gpu_memory_to_use'] = str(fraction)
+    logger.info(f"[INFO] 预设 GPU{PADDLE_GPU_ID} 显存比例: {fraction:.1%} ({PADDLE_GPU_MEMORY_GB}GB)")
+
+
+def _print_gpu_info():
+    """打印当前 GPU 信息（paddle 已 import 后）"""
+    try:
+        from config import PADDLE_DEVICE, PADDLE_GPU_MEMORY_GB, PADDLE_GPU_ID
+        if PADDLE_DEVICE != 'gpu':
+            return
+        import paddle
+        if not paddle.device.is_compiled_with_cuda():
+            logger.warning("[WARNING] PaddlePaddle未编译GPU支持，使用CPU")
+            return
+        gpu_props = paddle.device.cuda.get_device_properties(PADDLE_GPU_ID)
+        total_gb = gpu_props.total_memory / (1024 ** 3)
+        logger.info(f"[INFO] GPU{PADDLE_GPU_ID} ({gpu_props.name}) 总显存 {total_gb:.1f}GB, "
+                    f"限制 {PADDLE_GPU_MEMORY_GB}GB")
+    except Exception as e:
+        logger.warning(f"[WARNING] GPU信息查询失败: {e}")
+
+
+# ============================================================
+# PP-StructureV3 引擎（单例）
 # ============================================================
 _PP_STRUCTURE_ENGINE = None
 
@@ -57,17 +101,15 @@ def _get_paddle_engine(device: str):
     if _PP_STRUCTURE_ENGINE is not None:
         return _PP_STRUCTURE_ENGINE
 
-    from config import PADDLE_GPU_MEMORY_GB, PADDLE_GPU_ID, PADDLE_DEVICE
-    _setup_gpu_memory_limit()
+    from config import PADDLE_GPU_ID, PADDLE_DEVICE
+    _print_gpu_info()
 
-    # PaddleOCR 3.x 推荐入口
     try:
         from paddleocr import PPStructureV3
     except ImportError as e:
-        raise ImportError(
-            "未安装 paddleocr，请运行: pip install paddleocr"
-        ) from e
+        raise ImportError("未安装 paddleocr，请运行: pip install paddleocr") from e
 
+    logger.info(f"[INFO] 初始化 PP-StructureV3 (device={device})...")
     _PP_STRUCTURE_ENGINE = PPStructureV3(
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
@@ -76,74 +118,20 @@ def _get_paddle_engine(device: str):
         use_formula_recognition=False,
         use_table_recognition=True,
         use_chart_recognition=False,
+        use_region_detection=True,
         lang='ch',
         device=device,
     )
+    logger.info("[INFO] PP-StructureV3 初始化完成")
     return _PP_STRUCTURE_ENGINE
 
 
-def _setup_gpu_memory_limit():
-    """显示当前 GPU 显存限制信息
-
-    实际的显存控制由 _pre_setup_gpu_env() 在 import paddle 之前通过环境变量
-    FLAGS_fraction_of_gpu_memory_to_use 完成。此函数仅在 paddle 已初始化后
-    打印实际生效的 GPU 信息。
-    """
-    from config import PADDLE_DEVICE, PADDLE_GPU_MEMORY_GB, PADDLE_GPU_ID
-
-    if PADDLE_DEVICE != 'gpu' or not PADDLE_GPU_MEMORY_GB:
-        return
-
-    try:
-        import paddle
-        if not paddle.device.is_compiled_with_cuda():
-            print("[WARNING] PaddlePaddle未编译GPU支持，回退到CPU模式")
-            return
-
-        gpu_props = paddle.device.cuda.get_device_properties(PADDLE_GPU_ID)
-        total_gb = gpu_props.total_memory / (1024 ** 3)
-        gpu_name = gpu_props.name
-        print(f"[INFO] GPU{PADDLE_GPU_ID} ({gpu_name}) 总显存 {total_gb:.1f}GB, "
-              f"使用限制 {PADDLE_GPU_MEMORY_GB}GB")
-    except Exception as e:
-        print(f"[WARNING] GPU信息查询失败: {e}")
-
-
-def _pre_setup_gpu_env():
-    """在 import paddle 之前预设 GPU 显存环境变量
-
-    必须在 main 入口的最初调用，作用于整个进程。
-    """
-    import os
-    from config import PADDLE_DEVICE, PADDLE_GPU_MEMORY_GB, PADDLE_GPU_ID
-
-    if PADDLE_DEVICE != 'gpu' or not PADDLE_GPU_MEMORY_GB:
-        return
-
-    # 选择 GPU
-    os.environ['FLAGS_selected_gpus'] = str(PADDLE_GPU_ID)
-    os.environ.setdefault('CUDA_VISIBLE_DEVICES', str(PADDLE_GPU_ID))
-
-    # 计算显存比例（基于常见显卡估算，实际 GPU0 上限是 fraction × 总显存）
-    # 保守估计：24GB 卡 → 默认用 PADDLE_GPU_MEMORY_GB
-    # 实际 PaddlePaddle 会在初始化时用此 fraction，若实际 GPU 更小会按比例缩放
-    # 为安全起见，使用用户配置值直接换算，但限制最大 0.95
-    try:
-        # 默认 0.5 (即 50% 显存) 作为兜底
-        # 实际比例会在 _setup_gpu_memory_limit 中基于实际卡算
-        fraction = min(PADDLE_GPU_MEMORY_GB / 24.0, 0.95)
-    except Exception:
-        fraction = 0.5
-    os.environ['FLAGS_fraction_of_gpu_memory_to_use'] = str(fraction)
-    print(f"[INFO] 预设 GPU{PADDLE_GPU_ID} 显存比例: {fraction:.1%} ({PADDLE_GPU_MEMORY_GB}GB/24GB估算)")
-
-
 # ============================================================
-# 兼容旧接口：detect_pdf_type 保留，但已不再分支
+# 兼容旧接口
 # ============================================================
 def detect_pdf_type(pdf_path: str) -> str:
     """保留接口：现在所有 PDF 都走版面分析路径"""
-    return 'layout'  # 统一标记
+    return 'layout'
 
 
 # ============================================================
@@ -151,81 +139,265 @@ def detect_pdf_type(pdf_path: str) -> str:
 # ============================================================
 def extract_with_layout_analysis(pdf_path: str, dpi: int = 200) -> List[ContentElement]:
     """对 PDF 的每一页执行：
-    1. PyMuPDF 把页面渲染为高分辨率图像（供 PP-StructureV3 识别）
-    2. PyMuPDF 提取页面文字 spans（供字体/字号/粗体推断）
-    3. PP-StructureV3 对图像做版面分析 → 给出 region (title/text/table/figure)
-    4. 按 region 聚合 spans 内的字体信息
+    1. PyMuPDF 把页面渲染为临时 PNG 文件
+    2. PyMuPDF 提取页面文字 spans（用于字体推断）
+    3. PP-StructureV3.predict() 对图像做版面分析
+    4. 把 result 转成 ContentElement
     """
     from config import PADDLE_DEVICE, PADDLE_GPU_ID
 
     device = f'gpu:{PADDLE_GPU_ID}' if PADDLE_DEVICE == 'gpu' else 'cpu'
     engine = _get_paddle_engine(device)
 
-    import numpy as np
-
     doc = fitz.open(pdf_path)
     elements: List[ContentElement] = []
+    total_pages = len(doc)
 
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        page_width = page.rect.width
-        page_height = page.rect.height
-        scale = dpi / 72.0  # 像素/pt 的换算系数
+    # 临时目录存放每页的 PNG
+    tmp_dir = tempfile.mkdtemp(prefix='pdf2word_')
+    logger.info(f"[INFO] 临时目录: {tmp_dir}")
 
-        # 1. 渲染为图像
-        mat = fitz.Matrix(scale, scale)
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img_array = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
-            pix.height, pix.width, pix.n
-        )
-        if pix.n == 4:
-            img_array = img_array[:, :, :3]
+    try:
+        for page_num in range(total_pages):
+            page = doc.load_page(page_num)
+            page_width = page.rect.width
+            page_height = page.rect.height
+            scale = dpi / 72.0
 
-        # 2. PyMuPDF 提取 spans（按行聚合）
-        page_spans = _extract_page_spans(page)
+            # 1. 渲染为 PNG 文件
+            mat = fitz.Matrix(scale, scale)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img_path = os.path.join(tmp_dir, f'page_{page_num:04d}.png')
+            pix.save(img_path)
 
-        # 3. PP-StructureV3 版面分析
-        # v3 predict() 接受 numpy array 或文件路径
+            # 2. PyMuPDF 提取 spans（字体/字号/粗体）
+            page_spans = _extract_page_spans(page)
+
+            # 3. PP-StructureV3 版面分析（接受文件路径）
+            t0 = time.time()
+            try:
+                result_iter = engine.predict(img_path)
+                # v3 返回 generator，每个元素是整页的 LayoutParsingResultV2
+                results = list(result_iter)
+            except Exception as e:
+                logger.error(f"[ERROR] 第{page_num+1}页版面分析失败: {e}")
+                # 打印前 1 行用于诊断
+                import traceback
+                logger.error(traceback.format_exc()[:2000])
+                continue
+            elapsed = time.time() - t0
+            logger.info(f"[INFO] 第{page_num+1}/{total_pages}页 用时 {elapsed:.1f}s, "
+                        f"识别到 {len(results)} 个版面结果")
+
+            if not results:
+                # 调试：打印 res 类型和属性
+                logger.warning(f"[WARN] 第{page_num+1}页无版面结果，跳过")
+                continue
+
+            # 5. 从每个 res (整页) 中提取 ContentElement
+            for res in results:
+                page_elems = _parse_layout_result(
+                    res, page_num, page_width, page_height, scale, page_spans
+                )
+                elements.extend(page_elems)
+
+    finally:
+        # 清理临时文件
         try:
-            layout_result = engine.predict(img_array)
-        except TypeError:
-            # 兼容性回退
-            layout_result = engine(img_array)
-
-        # 4. 遍历版面分析结果，转换为 ContentElement
-        for region in layout_result:
-            elem = _convert_region(
-                region, page_num, page_width, page_height,
-                scale, img_array, page_spans,
-            )
-            if elem is not None:
-                elements.append(elem)
-
-    doc.close()
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        doc.close()
 
     # 按页面和位置排序
-    elements.sort(key=lambda e: (e.page_num, e.bbox[1] if e.bbox else 0,
+    elements.sort(key=lambda e: (e.page_num,
+                                  e.bbox[1] if e.bbox else 0,
                                   e.bbox[0] if e.bbox else 0))
     return elements
+
+
+# ============================================================
+# 解析 PP-StructureV3 的 LayoutParsingResultV2 结果
+# ============================================================
+def _parse_layout_result(res, page_num: int, page_width: float,
+                          page_height: float, scale: float,
+                          page_spans: List[Dict]) -> List[ContentElement]:
+    """从 LayoutParsingResultV2 解析出 ContentElement 列表
+
+    res 可能是以下之一：
+    1. LayoutParsingResultV2 对象（有 _to_json() / json 属性）
+    2. dict（早期版本）
+    """
+    # 先尝试拿到 dict/json 形式
+    if hasattr(res, 'json'):
+        try:
+            data = res.json
+            if isinstance(data, str):
+                import json
+                data = json.loads(data)
+        except Exception:
+            data = None
+    elif hasattr(res, '_to_json'):
+        try:
+            data = res._to_json()
+        except Exception:
+            data = None
+    elif isinstance(res, dict):
+        data = res
+    else:
+        logger.warning(f"[WARN] 未知的 res 类型: {type(res)}")
+        return []
+
+    if not data:
+        # 第一次失败时打印 res 详细信息（仅 page 0）
+        if page_num == 0:
+            logger.warning(f"[DEBUG page0] res type: {type(res).__name__}")
+            if hasattr(res, '__dict__'):
+                logger.warning(f"[DEBUG page0] res attrs: {list(res.__dict__.keys())[:15]}")
+            if hasattr(res, 'keys'):
+                try:
+                    logger.warning(f"[DEBUG page0] res keys: {list(res.keys())[:15]}")
+                except Exception:
+                    pass
+            # 尝试常见属性
+            for attr in ['json', 'markdown', 'html', 'rec_text', 'pred_html', 'res', '_to_json']:
+                if hasattr(res, attr):
+                    try:
+                        v = getattr(res, attr)
+                        if callable(v):
+                            try:
+                                v = v()
+                            except Exception:
+                                v = '<callable err>'
+                        preview = str(v)[:200]
+                        logger.warning(f"[DEBUG page0] res.{attr} = {preview}")
+                    except Exception as e:
+                        logger.warning(f"[DEBUG page0] res.{attr} err: {e}")
+        logger.warning(f"[WARN] 无法从 res 解析数据")
+        return []
+
+    # 真实的版面数据在 data['res']['parsing_res_list'] 里
+    # 顶层是 {'res': {'parsing_res_list': [...], 'layout_det_res': {...}}}
+    inner = data.get('res', data)
+
+    elements: List[ContentElement] = []
+
+    # ---- 路径 1：parsing_res_list（layout_parsing_v2 格式）----
+    if 'parsing_res_list' in inner:
+        for block in inner['parsing_res_list']:
+            block_type = block.get('block_label') or block.get('type', 'text')
+            bbox = block.get('block_bbox') or block.get('bbox', [0, 0, 0, 0])
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+
+            # 像素坐标 → PDF 点
+            pdf_bbox = [b / scale for b in bbox]
+
+            # 找 region 内的 spans
+            matched_spans = _find_spans_in_region(page_spans, pdf_bbox)
+            style = _aggregate_span_style(matched_spans)
+
+            # 文本内容
+            text = block.get('text', '') or block.get('content', '')
+
+            if block_type in ('title', 'paragraph_title', 'heading', 'doc_title'):
+                elements.append(ContentElement(
+                    type='heading',
+                    text=text,
+                    bbox=pdf_bbox,
+                    page_num=page_num,
+                    font_name=style['font_name'],
+                    font_size=style['font_size'],
+                    is_bold=style['is_bold'],
+                    is_italic=style['is_italic'],
+                    alignment=_detect_alignment(pdf_bbox, page_width),
+                ))
+            elif block_type in ('text', 'paragraph', 'content', 'reference',
+                                 'abstract', 'algorithm', 'header', 'footer',
+                                 'figure_title', 'table_title'):
+                elements.append(ContentElement(
+                    type='text',
+                    text=text,
+                    bbox=pdf_bbox,
+                    page_num=page_num,
+                    font_name=style['font_name'],
+                    font_size=style['font_size'],
+                    is_bold=style['is_bold'],
+                    is_italic=style['is_italic'],
+                    alignment=_detect_alignment(pdf_bbox, page_width),
+                ))
+            elif block_type in ('table', 'wired_table', 'wireless_table'):
+                # 表格的 HTML 在 table_res_list 里
+                html = block.get('pred_html', '') or block.get('html', '')
+                if not html and 'table_ocr_pred' in block:
+                    # 拼装简化 HTML
+                    html = _build_simple_table_html(block.get('table_ocr_pred', {}))
+                if html:
+                    elements.append(ContentElement(
+                        type='table', text='', bbox=pdf_bbox, page_num=page_num,
+                        html=html,
+                    ))
+            elif block_type in ('figure', 'image', 'chart'):
+                # 跳过图片裁剪（PP-StructureV3 不便直接拿到原图像素）
+                pass
+
+    # ---- 路径 2：layout_det_res（layout_detection 格式）----
+    elif 'layout_det_res' in inner:
+        boxes = inner['layout_det_res'].get('boxes', [])
+        for box in boxes:
+            label = box.get('label', 'text')
+            bbox = box.get('coordinate') or box.get('bbox', [0, 0, 0, 0])
+            if not isinstance(bbox, list) or len(bbox) != 4:
+                continue
+            pdf_bbox = [b / scale for b in bbox]
+            matched_spans = _find_spans_in_region(page_spans, pdf_bbox)
+            style = _aggregate_span_style(matched_spans)
+            text = box.get('text', '')
+
+            if label in ('title', 'paragraph_title', 'heading', 'doc_title'):
+                t = 'heading'
+            elif label in ('text', 'paragraph', 'content'):
+                t = 'text'
+            elif label in ('table',):
+                t = 'table'
+            elif label in ('figure', 'image'):
+                t = 'image'
+            else:
+                continue
+
+            elem = ContentElement(
+                type=t, text=text, bbox=pdf_bbox, page_num=page_num,
+                font_name=style['font_name'], font_size=style['font_size'],
+                is_bold=style['is_bold'], is_italic=style['is_italic'],
+                alignment=_detect_alignment(pdf_bbox, page_width),
+            )
+            elements.append(elem)
+
+    else:
+        logger.warning(f"[WARN] 未知的 res 结构，keys: {list(inner.keys())[:10]}")
+
+    return elements
+
+
+def _build_simple_table_html(table_ocr_pred: Dict) -> str:
+    """从 OCR 预测结果拼装简化 HTML 表格"""
+    rec_texts = table_ocr_pred.get('rec_texts', [])
+    rec_boxes = table_ocr_pred.get('rec_boxes', [])
+    if not rec_texts:
+        return ''
+    # 简化处理：把每行文本作为一行（这里仅作占位）
+    rows_html = ''
+    for txt in rec_texts:
+        rows_html += f'<tr><td>{txt}</td></tr>'
+    return f'<table>{rows_html}</table>'
 
 
 # ============================================================
 # PyMuPDF span 提取
 # ============================================================
 def _extract_page_spans(page) -> List[Dict]:
-    """提取一页内所有 span 的字体信息
-
-    返回列表，每个元素：
-    {
-        'text': str,
-        'bbox': [x1, y1, x2, y2],  # in PDF points
-        'font': str,                # 字体名
-        'size': float,              # 字号 (pt)
-        'flags': int,               # 粗体/斜体标志
-        'is_bold': bool,
-        'is_italic': bool,
-    }
-    """
+    """提取一页内所有 span 的字体信息"""
     spans = []
     text_dict = page.get_text("dict")
     for block in text_dict.get("blocks", []):
@@ -251,7 +423,7 @@ def _extract_page_spans(page) -> List[Dict]:
 
 def _find_spans_in_region(spans: List[Dict], region_bbox: List[float],
                            overlap_threshold: float = 0.5) -> List[Dict]:
-    """找出落在 region 内的所有 spans（按重叠面积判断）"""
+    """找出落在 region 内的所有 spans"""
     rx1, ry1, rx2, ry2 = region_bbox
     region_area = (rx2 - rx1) * (ry2 - ry1)
     if region_area <= 0:
@@ -263,7 +435,6 @@ def _find_spans_in_region(spans: List[Dict], region_bbox: List[float],
         span_area = (sx2 - sx1) * (sy2 - sy1)
         if span_area <= 0:
             continue
-        # 计算重叠
         ox1 = max(rx1, sx1)
         oy1 = max(ry1, sy1)
         ox2 = min(rx2, sx2)
@@ -281,7 +452,6 @@ def _aggregate_span_style(spans: List[Dict]) -> Dict:
         return {'font_name': None, 'font_size': None,
                 'is_bold': None, 'is_italic': None}
 
-    # 按文本长度加权统计字号出现频次
     size_counter: Dict[float, int] = {}
     for s in spans:
         sz = round(s['size'], 1)
@@ -289,11 +459,9 @@ def _aggregate_span_style(spans: List[Dict]) -> Dict:
 
     dominant_size = max(size_counter, key=size_counter.get) if size_counter else 0
 
-    # 取该字号对应的 font 名（多数派）
     fonts_at_size = [s['font'] for s in spans if round(s['size'], 1) == dominant_size]
     font_name = max(set(fonts_at_size), key=fonts_at_size.count) if fonts_at_size else None
 
-    # 粗体/斜体：取多数派
     bold_count = sum(1 for s in spans if s['is_bold'])
     italic_count = sum(1 for s in spans if s['is_italic'])
     is_bold = bold_count > len(spans) / 2 if spans else None
@@ -307,147 +475,8 @@ def _aggregate_span_style(spans: List[Dict]) -> Dict:
     }
 
 
-# ============================================================
-# 版面区域 → ContentElement
-# ============================================================
-def _convert_region(region: Dict, page_num: int, page_width: float,
-                     page_height: float, scale: float,
-                     img_array, page_spans: List[Dict]) -> Optional[ContentElement]:
-    """把 PP-StructureV3 的一个 region 转成 ContentElement"""
-    region_type = region.get('type', 'text')
-
-    # bbox 是像素坐标，需要转回 PDF points
-    pixel_bbox = region.get('bbox', [0, 0, 0, 0])
-    if len(pixel_bbox) != 4:
-        return None
-    pdf_bbox = [b / scale for b in pixel_bbox]
-
-    # 找该 region 内的 spans
-    matched_spans = _find_spans_in_region(page_spans, pdf_bbox)
-    style = _aggregate_span_style(matched_spans)
-
-    # 提取文本
-    text, html = _extract_region_text(region, region_type, img_array, pixel_bbox, scale)
-
-    if region_type in ('title', 'paragraph_title', 'heading'):
-        return ContentElement(
-            type='heading',
-            text=text,
-            bbox=pdf_bbox,
-            page_num=page_num,
-            font_name=style['font_name'],
-            font_size=style['font_size'],
-            is_bold=style['is_bold'],
-            is_italic=style['is_italic'],
-            alignment=_detect_alignment(pdf_bbox, page_width),
-        )
-
-    elif region_type in ('text', 'paragraph', 'content', 'reference',
-                          'abstract', 'algorithm', 'footer', 'header'):
-        # 页眉页脚也按 text 处理，由后续 style_mapper/word_generator 决定是否过滤
-        if not text:
-            return None
-        return ContentElement(
-            type='text',
-            text=text,
-            bbox=pdf_bbox,
-            page_num=page_num,
-            font_name=style['font_name'],
-            font_size=style['font_size'],
-            is_bold=style['is_bold'],
-            is_italic=style['is_italic'],
-            alignment=_detect_alignment(pdf_bbox, page_width),
-        )
-
-    elif region_type in ('table', 'wired_table', 'wireless_table'):
-        if not html:
-            return None
-        return ContentElement(
-            type='table',
-            text='',
-            bbox=pdf_bbox,
-            page_num=page_num,
-            html=html,
-        )
-
-    elif region_type in ('figure', 'image', 'chart'):
-        # 裁剪图片区域
-        x1, y1, x2, y2 = [int(b) for b in pixel_bbox]
-        if x2 <= x1 or y2 <= y1:
-            return None
-        try:
-            import cv2
-            crop = img_array[y1:y2, x1:x2]
-            success, buf = cv2.imencode('.png', crop)
-            if not success:
-                return None
-            return ContentElement(
-                type='image',
-                text='',
-                bbox=pdf_bbox,
-                page_num=page_num,
-                image_data=buf.tobytes(),
-            )
-        except Exception:
-            return None
-
-    # 其他类型 (footnote, formula 等) 一律丢弃
-    return None
-
-
-def _extract_region_text(region: Dict, region_type: str, img_array,
-                          pixel_bbox: List[float], scale: float) -> Tuple[str, str]:
-    """从 region 中提取文本（text/title）或 HTML（table）
-
-    PP-StructureV3 v3 返回结构：
-    - text/title: region['res'] = {'rec_text': '完整文本', 'rec_boxes': [...], ...}
-                   或 region['res'] = [(box, (text, score)), ...]  (v2 兼容)
-    - table: region['res'] = {'html': '<table>...</table>', ...}
-    """
-    res = region.get('res')
-
-    # ---- text/title 提取 ----
-    if region_type in ('title', 'paragraph_title', 'heading',
-                        'text', 'paragraph', 'content'):
-        if res is None:
-            return '', ''
-
-        # v3 格式：dict 含 rec_text
-        if isinstance(res, dict):
-            text = res.get('rec_text', '') or res.get('text', '')
-            return text.strip(), ''
-
-        # v2 格式：list of (box, (text, score))
-        if isinstance(res, list):
-            texts = []
-            for item in res:
-                if isinstance(item, dict):
-                    texts.append(item.get('text', ''))
-                elif isinstance(item, (list, tuple)) and len(item) >= 2:
-                    txt = item[1]
-                    if isinstance(txt, (list, tuple)) and len(txt) >= 1:
-                        texts.append(str(txt[0]))
-                    else:
-                        texts.append(str(txt))
-            return ' '.join(texts).strip(), ''
-
-        return str(res).strip(), ''
-
-    # ---- table 提取 ----
-    if region_type in ('table', 'wired_table', 'wireless_table'):
-        if isinstance(res, dict):
-            html = res.get('html', '')
-            return '', html
-        if isinstance(res, str):
-            return '', res
-
-    return '', ''
-
-
-# ============================================================
-# 对齐方式检测
-# ============================================================
 def _detect_alignment(bbox, page_width) -> str:
+    """根据bbox位置检测对齐方式"""
     x1, y1, x2, y2 = bbox
     left = x1
     right = page_width - x2
@@ -462,13 +491,11 @@ def _detect_alignment(bbox, page_width) -> str:
 
 
 # ============================================================
-# 兼容旧接口（保留以防外部调用）
+# 兼容旧接口
 # ============================================================
 def extract_native_pdf(pdf_path: str) -> List[ContentElement]:
-    """兼容旧接口：现在等价于版面分析路径"""
     return extract_with_layout_analysis(pdf_path, dpi=200)
 
 
 def extract_scanned_pdf(pdf_path: str) -> List[ContentElement]:
-    """兼容旧接口：扫描件也用同一路径，仅 DPI 略高以获得更精确 OCR"""
     return extract_with_layout_analysis(pdf_path, dpi=300)
