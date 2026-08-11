@@ -30,6 +30,38 @@ from style_mapper import FigureTableCounter
 
 
 # ============================================================
+# 页眉页脚检测
+# ============================================================
+_HEADER_FOOTER_RE = re.compile(
+    r'^(第\s*\d+\s*页|'
+    r'-\s*\d+\s*-|'                  # - 5 -
+    r'第\s*[零一二三四五六七八九十百千0-9]+\s*页|'
+    r'Page\s*\d+|'                   # Page 3
+    r'\d+\s*/\s*\d+\s*$|'            # 3/10
+    r'[\-—]\s*\d+\s*[\-—]\s*$)'      # -3- / —3—
+)
+
+
+def _is_likely_header_footer(text: str) -> bool:
+    """判断文本是否像页眉页脚
+
+    规则：
+    1. 长度 <= 20 字符
+    2. 匹配"第N页"/"-3-"/"Page 3"/"3/10"等页码模式
+    3. 全是数字或"-"的组合
+    """
+    text = text.strip()
+    if len(text) > 20:
+        return False
+    if _HEADER_FOOTER_RE.match(text):
+        return True
+    # 纯数字/罗马数字短文本
+    if len(text) <= 6 and re.fullmatch(r'[\dIVXLCDM\-—/、\s]+', text):
+        return True
+    return False
+
+
+# ============================================================
 # 底层XML操作工具
 # ============================================================
 def _set_run_font(run, cn_font='宋体', en_font='Times New Roman',
@@ -132,27 +164,34 @@ def setup_page(doc: Document):
 # ============================================================
 # 正文段落
 # ============================================================
-def add_body_paragraph(doc: Document, text: str):
+def add_body_paragraph(doc: Document, text: str, size_pt: float = None,
+                        alignment: str = 'left', bold: bool = False):
     """添加正文段落
 
-    宋体+Times New Roman，小四号(12pt)，1.5倍行距，首行缩进2字符
+    宋体+Times New Roman，小四号(12pt)或指定字号，1.5倍行距，首行缩进2字符
     """
     p = doc.add_paragraph()
     run = p.add_run(text)
+    actual_size = size_pt if size_pt and size_pt > 0 else BODY_FONT['size_pt']
     _set_run_font(run,
                   cn_font=BODY_FONT['cn'],
                   en_font=BODY_FONT['en'],
-                  size_pt=BODY_FONT['size_pt'],
-                  bold=BODY_FONT['bold'])
+                  size_pt=actual_size,
+                  bold=bold)
     _set_paragraph_spacing(p,
                            line_spacing=BODY_FONT['line_spacing'],
                            space_before=BODY_FONT['space_before_pt'],
                            space_after=BODY_FONT['space_after_pt'],
                            snap_to_grid=BODY_FONT['snap_to_grid'])
     # 首行缩进2字符 = 2 * 字号
-    indent_pt = BODY_FONT['size_pt'] * BODY_FONT['first_line_indent_chars']
+    indent_pt = actual_size * BODY_FONT['first_line_indent_chars']
     p.paragraph_format.first_line_indent = Pt(indent_pt)
-    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    if alignment == 'center':
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    elif alignment == 'right':
+        p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    else:
+        p.alignment = WD_ALIGN_PARAGRAPH.LEFT
 
 
 # ============================================================
@@ -374,8 +413,19 @@ def generate_word(elements: List[ContentElement], output_path: str):
         else:
             # 正文
             text = elem.text.strip()
-            if text:
-                add_body_paragraph(doc, text)
+            if not text:
+                continue
+
+            # 过滤明显是页眉页脚的内容：单独成行且极短、纯数字
+            if _is_likely_header_footer(text):
+                continue
+
+            add_body_paragraph(
+                doc, text,
+                size_pt=elem.mapped_size,
+                alignment=elem.alignment or 'left',
+                bold=bool(elem.is_bold),
+            )
 
     # 5. 保存文档
     doc.save(output_path)

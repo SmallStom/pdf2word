@@ -16,10 +16,7 @@ from pdf_extractor import ContentElement
 # 字号映射
 # ============================================================
 def map_font_size(pt_value: float) -> float:
-    """将识别到的磅值映射到模板标准字号
-
-    在 [16, 15, 14, 12, 10.5] 中找最接近的值。
-    """
+    """将识别到的磅值映射到模板标准字号"""
     if pt_value is None or pt_value <= 0:
         return BODY_FONT['size_pt']
     return min(TEMPLATE_FONT_SIZES, key=lambda s: abs(s - pt_value))
@@ -29,24 +26,18 @@ def map_font_size(pt_value: float) -> float:
 # 正文字号检测
 # ============================================================
 def detect_body_font_size(elements: List[ContentElement]) -> float:
-    """检测正文字号（所有文本块中出现频率最高的字号）
-
-    用于作为标题判断的基线：字号明显大于正文的文本块可能是标题。
-    """
+    """检测正文字号（所有文本块中出现频率最高的字号）"""
     sizes = []
     for elem in elements:
         if elem.type == 'text' and elem.font_size and elem.font_size > 0:
-            # 将字号四舍五入到0.5精度，便于统计
             rounded = round(elem.font_size * 2) / 2
             sizes.append(rounded)
 
     if not sizes:
-        return BODY_FONT['size_pt']  # 默认小四号
+        return BODY_FONT['size_pt']
 
-    # 取众数
     size_counter = Counter(sizes)
-    body_size = size_counter.most_common(1)[0][0]
-    return body_size
+    return size_counter.most_common(1)[0][0]
 
 
 # ============================================================
@@ -55,26 +46,42 @@ def detect_body_font_size(elements: List[ContentElement]) -> float:
 def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]:
     """推断标题层级（1-4），非标题返回None
 
-    信号优先级：
-    1. 文本模式匹配（正则）- 最可靠
-    2. 字号判断（原生PDF有字号信息时）
-    3. 加粗+字号大于正文
+    信号优先级（从强到弱）：
+    1. 元素 type 已经是 'heading'（来自 PP-StructureV3 版面分析）
+    2. 文本模式匹配（中文标题编号正则）
+    3. 字号判断（>=16pt 必为标题）
+    4. 加粗+字号大于正文
     """
     text = elem.text.strip()
     if not text:
         return None
 
-    # 过滤过长的文本（标题通常不超过80字符）
-    if len(text) > 80:
+    # 标题通常不会超过 100 字符
+    if len(text) > 100:
         return None
 
     font_size = elem.font_size
     is_bold = elem.is_bold
 
-    # ---- 信号1：文本模式匹配 ----
+    # ---- 信号1：版面分析已识别为标题 ----
+    if elem.type == 'heading':
+        # 在此基础上再细化层级
+        pattern_level = _match_heading_pattern(text)
+        if pattern_level:
+            return pattern_level
+        # 无模式：按字号细分
+        if font_size and font_size >= 16:
+            return 1
+        if font_size and font_size >= 15:
+            return 2
+        if font_size and font_size >= 14:
+            return 3
+        return 4  # 加粗但字号接近正文
+
+    # ---- 信号2：文本模式匹配 ----
     pattern_level = _match_heading_pattern(text)
 
-    # ---- 信号2：字号判断（原生PDF） ----
+    # ---- 信号3：字号判断 ----
     size_level = None
     if font_size and font_size > 0:
         if font_size >= 16:
@@ -86,7 +93,7 @@ def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]
         elif font_size >= 13 and (is_bold or (body_size > 0 and font_size > body_size * 1.05)):
             size_level = 4
 
-    # ---- 信号3：加粗+字号大于正文 ----
+    # ---- 信号4：加粗+字号大于正文 ----
     bold_level = None
     if is_bold and body_size > 0 and font_size:
         ratio = font_size / body_size
@@ -97,22 +104,17 @@ def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]
         elif ratio >= 1.05:
             bold_level = 3
         else:
-            bold_level = 4  # 加粗但字号相近
+            bold_level = 4
 
     # ---- 融合决策 ----
-    # 优先使用文本模式（最可靠）
     if pattern_level:
-        # 如果同时有字号信息且字号支持该判断，直接采用
         if size_level and size_level != pattern_level:
-            # 模式和字号冲突时，取较高级别（较小的数字）
             return min(pattern_level, size_level)
         return pattern_level
 
-    # 无模式匹配时，用字号判断
     if size_level:
         return size_level
 
-    # 最后用加粗判断
     if bold_level:
         return bold_level
 
@@ -120,7 +122,7 @@ def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]
 
 
 def _match_heading_pattern(text: str) -> Optional[int]:
-    """匹配中文标题编号模式"""
+    """匹配中文标题编号模式（宽松版）"""
     text = text.strip()
     for level, pattern in HEADING_PATTERNS:
         if pattern.match(text):
@@ -139,20 +141,16 @@ _CN_NUM_MAP = {
 
 
 def chinese_to_int(cn_str: str) -> int:
-    """将中文数字转为阿拉伯数字
-
-    例：一->1, 十->10, 十一->11, 二十三->23, 一百零五->105
-    """
+    """将中文数字转为阿拉伯数字"""
     if cn_str.isdigit():
         return int(cn_str)
-
     result = 0
     current = 0
     for char in cn_str:
         if char not in _CN_NUM_MAP:
             continue
         val = _CN_NUM_MAP[char]
-        if val >= 10:  # 十/百/千
+        if val >= 10:
             if current == 0:
                 current = 1
             result += current * val
@@ -163,48 +161,37 @@ def chinese_to_int(cn_str: str) -> int:
     return result if result > 0 else 1
 
 
-# ============================================================
-# 章节号提取
-# ============================================================
 def extract_chapter_number(heading_text: str) -> int:
-    """从一级标题文本中提取章节号
-
-    支持：第X章、第X部分、第X编、第X篇、数字开头
-    """
+    """从一级标题文本中提取章节号"""
     text = heading_text.strip()
 
-    # 第X章/部分/编/篇
-    m = re.match(r'^第([零一二三四五六七八九十百千0-9]+)[章部分编篇]', text)
+    # 第X章/部分/编/篇（兼容"第1章"、"第一章"、"第 1 章"）
+    m = re.match(r'^第\s*([零一二三四五六七八九十百千0-9]+)\s*[章部分编篇]', text)
     if m:
-        return chinese_to_int(m.group(1))
+        return chinese_to_int(m.group(1).replace(' ', ''))
 
-    # 纯数字开头：如 "1 概述" 或 "1.概述"
-    m = re.match(r'^(\d+)[\s.．、]', text)
+    # 纯数字开头："1 概述"、"1.概述"、"1、概述"
+    m = re.match(r'^(\d+)\s*[.．、\s]', text)
     if m:
         return int(m.group(1))
 
-    return 0  # 无法提取
+    return 0
 
 
 # ============================================================
 # 图表编号管理器
 # ============================================================
 class FigureTableCounter:
-    """跟踪当前章节，自动分章编号图片和表格
-
-    生成编号格式：图X-Y、表X-Y（X=章节号，Y=章内序号）
-    若无章节号则使用顺序编号：图1、图2...
-    """
+    """跟踪当前章节，自动分章编号图片和表格"""
 
     def __init__(self):
-        self._current_chapter = 0  # 当前章节号（0表示未进入任何章节）
-        self._fig_count = 0        # 当前章节的图片序号
-        self._tbl_count = 0        # 当前章节的表格序号
-        self._global_fig = 0       # 全局图片序号（无章节号时使用）
-        self._global_tbl = 0       # 全局表格序号（无章节号时使用）
+        self._current_chapter = 0
+        self._fig_count = 0
+        self._tbl_count = 0
+        self._global_fig = 0
+        self._global_tbl = 0
 
     def update_chapter(self, heading_text: str, heading_level: int):
-        """遇到标题时更新当前章节号"""
         if heading_level == 1:
             chapter_num = extract_chapter_number(heading_text)
             if chapter_num > 0:
@@ -212,13 +199,11 @@ class FigureTableCounter:
                 self._fig_count = 0
                 self._tbl_count = 0
             else:
-                # 无法提取章节号，使用自增
                 self._current_chapter += 1
                 self._fig_count = 0
                 self._tbl_count = 0
 
     def next_figure_number(self) -> str:
-        """获取下一个图片编号"""
         if self._current_chapter > 0:
             self._fig_count += 1
             return f"图{self._current_chapter}-{self._fig_count}"
@@ -227,7 +212,6 @@ class FigureTableCounter:
             return f"图{self._global_fig}"
 
     def next_table_number(self) -> str:
-        """获取下一个表格编号"""
         if self._current_chapter > 0:
             self._tbl_count += 1
             return f"表{self._current_chapter}-{self._tbl_count}"
