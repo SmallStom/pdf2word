@@ -291,9 +291,10 @@ def add_body_paragraph(doc: Document, text: str, size_pt: float = None,
                            space_before=BODY_FONT['space_before_pt'],
                            space_after=BODY_FONT['space_after_pt'],
                            snap_to_grid=BODY_FONT['snap_to_grid'])
-    # 首行缩进2字符 = 2 * 字号
-    indent_pt = actual_size * BODY_FONT['first_line_indent_chars']
-    p.paragraph_format.first_line_indent = Pt(indent_pt)
+    # 首行缩进 2 字符 = 2 * 字号（仅左对齐段落需要，居中/右对齐不应缩进）
+    if alignment == 'left':
+        indent_pt = actual_size * BODY_FONT['first_line_indent_chars']
+        p.paragraph_format.first_line_indent = Pt(indent_pt)
     if alignment == 'center':
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     elif alignment == 'right':

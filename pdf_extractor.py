@@ -322,9 +322,14 @@ def _parse_layout_result(res, page_num: int, page_width: float,
             matched_spans = _find_spans_in_region(page_spans, pdf_bbox)
             style = _aggregate_span_style(matched_spans)
 
-            # 对齐方式：优先 block 自带，再 span 位置检测
-            alignment = _extract_block_alignment(block) \
-                or _detect_alignment(pdf_bbox, page_width, matched_spans)
+            # 对齐方式：多信号综合判断
+            # 把 PyMuPDF block 的 bbox 优先用上（段落级，比 PP-StructureV3 region bbox 更准）
+            pymupdf_bbox = _get_pymupdf_block_bbox(matched_spans) if matched_spans else None
+            effective_bbox = pymupdf_bbox if pymupdf_bbox else pdf_bbox
+            alignment = _detect_alignment(
+                effective_bbox, page_width, matched_spans,
+                text=text, block_label=block_type, block=block
+            )
 
             # 文本内容：v3 字段是 block_content
             text = (block.get('block_content')
@@ -419,8 +424,10 @@ def _parse_layout_result(res, page_num: int, page_width: float,
             matched_spans = _find_spans_in_region(page_spans, pdf_bbox)
             style = _aggregate_span_style(matched_spans)
             text = box.get('text', '')
-            box_alignment = _extract_block_alignment(box) \
-                or _detect_alignment(pdf_bbox, page_width, matched_spans)
+            box_alignment = _detect_alignment(
+                pdf_bbox, page_width, matched_spans,
+                text=text, block_label=label, block=box
+            )
 
             if label in ('title', 'paragraph_title', 'heading', 'doc_title'):
                 t = 'heading'
@@ -542,19 +549,119 @@ def _aggregate_span_style(spans: List[Dict]) -> Dict:
     }
 
 
-def _detect_alignment(bbox, page_width, spans: List[Dict] = None) -> str:
-    """根据 bbox + 内部 span 位置 检测对齐方式
+def _detect_alignment(bbox, page_width, spans: List[Dict] = None,
+                     text: str = '', block_label: str = None,
+                     block: Dict = None) -> str:
+    """综合判断对齐方式 —— 多信号投票
 
-    算法（更可靠）：
-    1. 如果传了 spans，用所有 span 的 left/right 中位数算对齐
-       - 文本居中：左右边距大致相等
-       - 文本左对齐：左 margin 小，右 margin 大
-       - 文本右对齐：左 margin 大，右 margin 小
-    2. 否则用 bbox 粗略判断
+    信号优先级（从强到弱）：
+    1. PP-StructureV3 block 自带 alignment（v3 字段最可靠）
+    2. 文本特征（短文本、特殊符号、独立日期等 → 居中/右对齐的概率大）
+    3. block_label 暗示（doc_title/figure_title/table_title 多居中）
+    4. block bbox 几何（段落级，比 span 稳定）
+    5. span 检测（仅在 span 很多时用，span 少噪声大）
     """
-    if spans:
+    # ---- 信号1：block 自带 alignment（最可靠）----
+    block_align = _extract_block_alignment(block) if block else None
+    if block_align:
+        return block_align
+
+    # ---- 信号2：文本特征（基于经验规则）----
+    feature_align = _detect_alignment_from_features(text, block_label)
+    if feature_align:
+        return feature_align
+
+    # ---- 信号3：block_label 暗示 ----
+    label_align = _align_from_label(block_label)
+    if label_align:
+        return label_align
+
+    # ---- 信号4：block bbox 几何（段落级，比 span 稳定）----
+    bbox_align = _detect_alignment_from_bbox(bbox, page_width)
+    if bbox_align != 'left':
+        return bbox_align
+
+    # ---- 信号5：span 检测（仅在 span 很多时用）----
+    if spans and len(spans) >= 5:
         return _detect_alignment_from_spans(spans, page_width)
 
+    return 'left'
+
+
+def _get_pymupdf_block_bbox(spans: List[Dict]) -> Optional[List[float]]:
+    """从 spans 算出 PyMuPDF 段落级 bbox（x1, y1, x2, y2）"""
+    if not spans:
+        return None
+    try:
+        x1 = min(s['bbox'][0] for s in spans)
+        y1 = min(s['bbox'][1] for s in spans)
+        x2 = max(s['bbox'][2] for s in spans)
+        y2 = max(s['bbox'][3] for s in spans)
+        return [x1, y1, x2, y2]
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _detect_alignment_from_features(text: str, block_label: str = None) -> Optional[str]:
+    """根据文本特征推断对齐方式
+
+    经验规则：
+    - 极短文本（<= 8 字符）且非纯数字 → 标题/图名，多居中
+    - 居中常见模式：日期（YYYY年M月D日）、单独数字（页码/编号）、书名号内容
+    - 右对齐常见模式：日期、签名、版本号
+    """
+    if not text:
+        return None
+    text = text.strip()
+    if not text:
+        return None
+
+    # 规则1：超短文本（<= 8 字符）很可能是标题/图名/页码 → 居中
+    if len(text) <= 8 and not re.match(r'^[\s\d.。,，:：;；、\-—]+$', text):
+        # 排除纯数字（那是页码之类）
+        if not text.isdigit():
+            return 'center'
+
+    # 规则2：日期模式 → 居中或右对齐
+    if re.match(r'^\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*$', text):
+        return 'center'  # 单飞日期多居中
+    if re.match(r'^[一二三四五六七八九十0-9]{4}年[一二三四五六七八九十0-9]{1,2}月$', text):
+        return 'center'
+
+    # 规则3：独立数字（1-4 位）→ 居中
+    if re.match(r'^\d{1,4}$', text):
+        return 'center'
+
+    # 规则4：句号/问号/感叹号结尾的短句 → 可能是引用或独立段
+    if len(text) <= 15 and re.search(r'[。！？]$', text) and len(text) <= 12:
+        return 'center'
+
+    return None
+
+
+def _align_from_label(block_label: str = None) -> Optional[str]:
+    """根据 block_label 推断对齐"""
+    if not block_label:
+        return None
+    label_lower = block_label.lower()
+    # 几乎都居中的类型
+    if label_lower in ('doc_title', 'figure_title', 'table_title',
+                        'reference_title', 'algorithm_title', 'header', 'footer'):
+        return 'center'
+    # 经常居中的类型
+    if label_lower in ('paragraph_title', 'abstract_title'):
+        return 'center'
+    return None
+
+
+def _detect_alignment_from_bbox(bbox, page_width) -> str:
+    """block bbox 几何检测（段落级，比 span 稳定）
+
+    关键改进：
+    - 居中要求：左右 margin 接近 + 段落宽度 < 90% 页宽
+    - 右对齐要求：右 margin 极小 + 左 margin 显著 > 0
+    - 段落宽度 >= 90% 页宽 → 几乎都是左对齐
+    """
     x1, y1, x2, y2 = bbox
     left = x1
     right = page_width - x2
@@ -562,33 +669,63 @@ def _detect_alignment(bbox, page_width, spans: List[Dict] = None) -> str:
 
     # 容差：左右 margin 相差 < 5% 页宽 算居中
     tol = page_width * 0.05
+
+    # 如果段落几乎横跨整个页面 → 左对齐（margin 是页边距，不是"文字居中"）
+    if elem_width > page_width * 0.9:
+        return 'left'
+
+    # 居中：左右 margin 接近
     if abs(left - right) < tol and elem_width < page_width * 0.85:
         return 'center'
-    elif right < tol and left > tol:
+
+    # 右对齐：右边贴页边距，左边留大空白
+    if right < tol and left > tol:
         return 'right'
-    else:
-        return 'left'
+
+    return 'left'
 
 
 def _detect_alignment_from_spans(spans: List[Dict], page_width: float) -> str:
     """用 span 实际位置判断对齐（更精确）
 
-    spans 是 PyMuPDF 抽出的 span 列表，每条带 'bbox' [x1, y1, x2, y2]
+    关键算法：
+    1. 把 spans 按 y 坐标分组（行）
+    2. 取**第一行**的左 margin 来判定（最后一行 wrap 短行不可信）
+    3. 也用所有 span 整体 left/right 兜底
     """
     if not spans:
         return 'left'
 
-    # 取所有 span 的左边界和右边界
+    # 按 y 坐标排序（PDF 坐标 y 向下递增）
+    sorted_spans = sorted(spans, key=lambda s: (round(s['bbox'][1], 1), s['bbox'][0]))
+
+    # 第一行的 spans（y 坐标最小）
+    first_y = round(sorted_spans[0]['bbox'][1], 1)
+    first_line_spans = [s for s in sorted_spans if round(s['bbox'][1], 1) == first_y]
+
+    if first_line_spans:
+        first_left = min(s['bbox'][0] for s in first_line_spans)
+        first_right = page_width - max(s['bbox'][2] for s in first_line_spans)
+        # 容差：5% 页宽 = 约 30pt
+        tol = page_width * 0.05
+        # 第一行左边贴近左页边距（< 20% 页宽）→ 左对齐
+        # 0.2 容差考虑段落有左缩进（1-2 字符 = 24-48pt）
+        if first_left < page_width * 0.20:
+            return 'left'
+        # 第一行右边贴页边距 → 右对齐
+        if first_right < page_width * 0.08:
+            return 'right'
+        # 第一行左右 margin 都大 → 居中
+        if abs(first_left - first_right) < tol:
+            return 'center'
+
+    # 兜底：用所有 spans 整体判定
     lefts = [s['bbox'][0] for s in spans]
     rights = [s['bbox'][2] for s in spans]
-    # 用最左和最右（最保守的检测）
     min_left = min(lefts)
     max_right = max(rights)
-
     left_margin = min_left
     right_margin = page_width - max_right
-
-    # 容差：5% 页宽 = 约 30pt
     tol = page_width * 0.05
 
     if abs(left_margin - right_margin) < tol:
