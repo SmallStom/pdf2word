@@ -327,6 +327,20 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                     or block.get('content')
                     or block.get('text')
                     or '')
+            # 清理 OCR 错误（半全角混用、连续标点等）
+            if text:
+                import re as _re
+                # 修复全角冒号/斜杠（在 URL 场景）
+                text = _re.sub(r'(https?|ftp)\s*[：:]\s*/\s*/\s*', r'\1://', text)
+                text = _re.sub(r'([：:])\s*/\s*/\s*', r'://', text)
+                # 中文之间的半角空格去掉
+                text = _re.sub(r'([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])', r'\1\2', text)
+                # 修复"第X章"后多余空格
+                text = _re.sub(r'^(第\s*[零一二三四五六七八九十百千0-9]+\s*[章部分编篇节条款])\s+', r'\1', text)
+                # 修复连续标点
+                text = _re.sub(r'，\s*，', '，', text)
+                text = _re.sub(r'。\s*。', '。', text)
+                text = text.strip()
 
             if block_type in ('title', 'paragraph_title', 'heading', 'doc_title'):
                 elements.append(ContentElement(

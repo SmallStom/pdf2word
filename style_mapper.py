@@ -47,8 +47,8 @@ def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]
     """推断标题层级（1-4），非标题返回None
 
     信号优先级（从强到弱）：
-    1. 元素 type 已经是 'heading'（来自 PP-StructureV3 版面分析）
-    2. 文本模式匹配（中文标题编号正则）
+    1. 文本模式匹配（中文标题编号正则）—— 最可靠
+    2. 元素 type 已经是 'heading'（来自 PP-StructureV3 版面分析）
     3. 字号判断（>=16pt 必为标题）
     4. 加粗+字号大于正文
     """
@@ -63,28 +63,21 @@ def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]
     font_size = elem.font_size
     is_bold = elem.is_bold
 
-    # ---- 信号1：版面分析已识别为标题 ----
-    if elem.type == 'heading':
-        # 在此基础上再细化层级
-        pattern_level = _match_heading_pattern(text)
-        if pattern_level:
-            return pattern_level
-        # 无模式：按字号细分
-        if font_size and font_size >= 16:
-            return 1
-        if font_size and font_size >= 15:
-            return 2
-        if font_size and font_size >= 14:
-            return 3
-        return 4  # 加粗但字号接近正文
-
-    # ---- 信号2：文本模式匹配 ----
+    # ---- 信号1：文本模式匹配（最可靠，PP-StructureV3的字号不准）----
     pattern_level = _match_heading_pattern(text)
+
+    # ---- 信号2：版面分析已识别为标题 ----
+    layout_level = None
+    if elem.type == 'heading':
+        if pattern_level:
+            layout_level = pattern_level
+        else:
+            layout_level = 1  # 默认 1 级
 
     # ---- 信号3：字号判断 ----
     size_level = None
     if font_size and font_size > 0:
-        if font_size >= 16:
+        if font_size >= 18:
             size_level = 1
         elif font_size >= 15:
             size_level = 2
@@ -107,11 +100,15 @@ def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]
             bold_level = 4
 
     # ---- 融合决策 ----
+    # 文本模式最可靠，直接用
     if pattern_level:
-        if size_level and size_level != pattern_level:
-            return min(pattern_level, size_level)
         return pattern_level
 
+    # 版面分析识别为标题
+    if layout_level:
+        return layout_level
+
+    # 纯字号判断
     if size_level:
         return size_level
 

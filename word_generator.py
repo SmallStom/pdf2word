@@ -61,24 +61,64 @@ def _is_likely_header_footer(text: str) -> bool:
     return False
 
 
+def _clean_text(text: str) -> str:
+    """清理文本中的常见 OCR 错误和半全角混用
+
+    - 修复 https：// → https://
+    - 合并多余半角空格
+    - 修复 "第二章 投标人须知" 这种"中文标题+半角空格+中文"
+    """
+    if not text:
+        return text
+    text = text.strip()
+
+    # 修复全角冒号/斜杠（在 URL 场景）
+    text = re.sub(r'(https?|ftp)\s*[：:]\s*/\s*/\s*', r'\1://', text)
+    text = re.sub(r'([：:])\s*/\s*/\s*', r'://', text)
+
+    # 中文之间夹的半角空格 → 去掉（只处理"中文 中文"模式）
+    # 保留"中 1.0"等有意义空格
+    text = re.sub(r'([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])', r'\1\2', text)
+
+    # 修复 "第X章" 后多余空格
+    text = re.sub(r'^(第\s*[零一二三四五六七八九十百千0-9]+\s*[章部分编篇节条款])\s+', r'\1', text)
+    # "1.1" 后面多余空格
+    text = re.sub(r'^(\d+(?:\.\d+)+)\s{2,}', r'\1 ', text)
+
+    # 修复连续标点
+    text = re.sub(r'，\s*，', '，', text)
+    text = re.sub(r'。\s*。', '。', text)
+
+    return text.strip()
+
+
 # ============================================================
 # 底层XML操作工具
 # ============================================================
 def _set_run_font(run, cn_font='宋体', en_font='Times New Roman',
                   size_pt=12, bold=False, italic=False):
-    """设置Run的字体，正确处理中文（w:eastAsia）"""
-    run.font.name = en_font
-    run.font.size = Pt(size_pt)
-    run.bold = bold
-    run.italic = italic
-    # 设置中文字体
+    """设置Run的字体，正确处理中文（w:eastAsia / w:ascii / w:hAnsi）
+
+    注意：必须同时设置 ascii/hAnsi/eastAsia/cs 四种字体属性，
+    不能只设置 run.font.name（python-docx 会清空 eastAsia）
+    """
+    # 1. 通过 XML 直接设置所有字体属性（关键！）
     r = run._element
     rPr = r.get_or_add_rPr()
     rFonts = rPr.find(qn('w:rFonts'))
     if rFonts is None:
         rFonts = OxmlElement('w:rFonts')
         rPr.insert(0, rFonts)
+    # 必须同时设置 4 个属性，Word 才能正确显示中文
+    rFonts.set(qn('w:ascii'), en_font)
+    rFonts.set(qn('w:hAnsi'), en_font)
     rFonts.set(qn('w:eastAsia'), cn_font)
+    rFonts.set(qn('w:cs'), en_font)
+
+    # 2. 字号、加粗、斜体
+    run.font.size = Pt(size_pt)
+    run.bold = bold
+    run.italic = italic
 
 
 def _set_paragraph_spacing(paragraph, line_spacing=1.5,
@@ -161,6 +201,74 @@ def setup_page(doc: Document):
     section.footer_distance = Cm(HEADER_FOOTER_DISTANCE['footer_cm'])
 
 
+def setup_page_number_footer(doc: Document, start_at: int = 1):
+    """在 footer 添加 "第 X 页 共 Y 页" 格式的页码
+
+    启动编号从 start_at 开始（封面页可不计入）
+    """
+    section = doc.sections[0]
+    footer = section.footer
+    # 清空已有段落
+    for p in list(footer.paragraphs):
+        if p.text:
+            for r in p.runs:
+                r.text = ''
+
+    # 创建页码段落
+    p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+    p.text = ''
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+    # "第 "
+    run1 = p.add_run('第 ')
+    _set_run_font(run1, cn_font='宋体', en_font='Times New Roman', size_pt=10.5)
+
+    # PAGE 字段（当前页）
+    _add_field(p, 'PAGE')
+
+    # " 页 共 "
+    run2 = p.add_run(' 页 共 ')
+    _set_run_font(run2, cn_font='宋体', en_font='Times New Roman', size_pt=10.5)
+
+    # NUMPAGES 字段（总页数）
+    _add_field(p, 'NUMPAGES')
+
+    # " 页"
+    run3 = p.add_run(' 页')
+    _set_run_font(run3, cn_font='宋体', en_font='Times New Roman', size_pt=10.5)
+
+    # 启动编号
+    sectPr = section._sectPr
+    pgNumType = sectPr.find(qn('w:pgNumType'))
+    if pgNumType is None:
+        pgNumType = OxmlElement('w:pgNumType')
+        sectPr.append(pgNumType)
+    pgNumType.set(qn('w:start'), str(start_at))
+
+
+def _add_field(paragraph, field_code: str):
+    """在段落里插入 Word 字段（如 PAGE / NUMPAGES）"""
+    run = paragraph.add_run()
+    fldChar_begin = OxmlElement('w:fldChar')
+    fldChar_begin.set(qn('w:fldCharType'), 'begin')
+    instrText = OxmlElement('w:instrText')
+    instrText.set(qn('xml:space'), 'preserve')
+    instrText.text = f' {field_code} '
+    fldChar_separate = OxmlElement('w:fldChar')
+    fldChar_separate.set(qn('w:fldCharType'), 'separate')
+    fldChar_end = OxmlElement('w:fldChar')
+    fldChar_end.set(qn('w:fldCharType'), 'end')
+
+    run._element.append(fldChar_begin)
+    run._element.append(instrText)
+    run._element.append(fldChar_separate)
+    run._element.append(fldChar_end)
+
+    # 字段默认显示 "1"
+    run.text = '1'
+    _set_run_font(run, cn_font='宋体', en_font='Times New Roman', size_pt=10.5)
+
+
 # ============================================================
 # 正文段落
 # ============================================================
@@ -200,9 +308,35 @@ def add_body_paragraph(doc: Document, text: str, size_pt: float = None,
 def add_heading(doc: Document, text: str, level: int):
     """添加标题段落
 
+    使用 Word 原生 Heading 1/2/3 样式（支持大纲/目录/导航）
     宋体加粗，按层级设置字号（16/15/14/12pt）
     """
-    p = doc.add_paragraph()
+    # 使用 Word 原生 Heading 样式，让 Word 知道这是标题
+    # 这样 Word 的大纲视图、目录生成、导航窗格都能识别
+    heading_style_name = f'Heading {level}' if 1 <= level <= 9 else 'Heading 4'
+    try:
+        p = doc.add_paragraph(style=heading_style_name)
+    except KeyError:
+        # 退化：手动建样式
+        p = doc.add_paragraph()
+
+    # 清空原有的样式字体（python-docx 默认 Heading 样式可能是 Calibri）
+    p.style.font.name = HEADING_FONT['en']
+    p.style.font.size = Pt(HEADING_SIZES.get(level, HEADING_SIZES[4]))
+    p.style.font.bold = HEADING_FONT['bold']
+    # 同时设置 style 的中文/西文字体
+    rPr_style = p.style.element.get_or_add_rPr()
+    rFonts_style = rPr_style.find(qn('w:rFonts'))
+    if rFonts_style is None:
+        rFonts_style = OxmlElement('w:rFonts')
+        rPr_style.insert(0, rFonts_style)
+    rFonts_style.set(qn('w:ascii'), HEADING_FONT['en'])
+    rFonts_style.set(qn('w:hAnsi'), HEADING_FONT['en'])
+    rFonts_style.set(qn('w:eastAsia'), HEADING_FONT['cn'])
+    rFonts_style.set(qn('w:cs'), HEADING_FONT['en'])
+
+    # 添加 run 并设置 run 自己的字体（覆盖 style 的）
+    text = _clean_text(text)
     run = p.add_run(text)
     size = HEADING_SIZES.get(level, HEADING_SIZES[4])
     _set_run_font(run,
@@ -222,22 +356,63 @@ def add_heading(doc: Document, text: str, level: int):
 # 表格生成
 # ============================================================
 def _parse_html_table(html: str) -> List[List[str]]:
-    """解析HTML表格，返回行列数据"""
+    """解析HTML表格，返回行列数据
+
+    支持 colspan/rowspan/嵌套表格，规范化每个 row 的列数
+    """
     rows = []
+    # 1. 先把整段 HTML 里 <tbody>/<thead>/<tfoot> 包起来
     tr_pattern = re.compile(r'<tr[^>]*>(.*?)</tr>', re.DOTALL | re.IGNORECASE)
-    td_pattern = re.compile(r'<t[dh][^>]*>(.*?)</t[dh]>', re.DOTALL | re.IGNORECASE)
+    td_pattern = re.compile(
+        r'<(t[dh])\b([^>]*)>(.*?)</\1>',
+        re.DOTALL | re.IGNORECASE
+    )
 
     for tr_match in tr_pattern.finditer(html):
         row = []
         for td_match in td_pattern.finditer(tr_match.group(1)):
-            cell_text = td_match.group(1)
-            # 去除嵌套HTML标签
-            cell_text = re.sub(r'<[^>]+>', '', cell_text)
+            tag = td_match.group(1).lower()
+            attrs = td_match.group(2)
+            cell_text = td_match.group(3)
+
+            # 提取 colspan/rowspan
+            colspan = 1
+            rowspan = 1
+            m = re.search(r'colspan\s*=\s*["\']?(\d+)["\']?', attrs, re.IGNORECASE)
+            if m:
+                colspan = max(int(m.group(1)), 1)
+            m = re.search(r'rowspan\s*=\s*["\']?(\d+)["\']?', attrs, re.IGNORECASE)
+            if m:
+                rowspan = max(int(m.group(1)), 1)
+
+            # 去除嵌套表格：递归提取子表格的文本内容
+            inner_table = re.search(r'<table\b.*?</table>', cell_text, re.DOTALL | re.IGNORECASE)
+            if inner_table:
+                # 提取子表所有 td 的文字拼到当前单元格
+                inner_texts = re.findall(
+                    r'<t[dh][^>]*>(.*?)</t[dh]>',
+                    inner_table.group(0),
+                    re.DOTALL | re.IGNORECASE
+                )
+                cell_text = '\n'.join(re.sub(r'<[^>]+>', '', t) for t in inner_texts)
+            else:
+                # 去除嵌套HTML标签
+                cell_text = re.sub(r'<[^>]+>', '', cell_text)
+
             # 解码HTML实体
             cell_text = cell_text.replace('&lt;', '<').replace('&gt;', '>')
             cell_text = cell_text.replace('&amp;', '&').replace('&nbsp;', ' ')
+            cell_text = cell_text.replace('&quot;', '"').replace('&#39;', "'")
             cell_text = cell_text.strip()
-            row.append(cell_text)
+            # 把多空白压缩成单个换行（保留段落感）
+            cell_text = re.sub(r'\s*\n\s*', '\n', cell_text)
+
+            # 按 colspan 展开
+            for _ in range(colspan):
+                row.append(cell_text if colspan == 1 else '')
+            # 如果 colspan > 1，第一个 cell 保留文字，其余为空
+            if colspan > 1:
+                row[-colspan] = cell_text
         if row:
             rows.append(row)
     return rows
@@ -261,6 +436,11 @@ def add_table(doc: Document, html: str, counter: FigureTableCounter):
     num_cols = max(len(row) for row in rows)
     if num_cols == 0:
         return
+
+    # 规范化：所有行补齐到 num_cols
+    for row in rows:
+        while len(row) < num_cols:
+            row.append('')
 
     # 1. 添加表名（在表格上方）
     table_name = counter.next_table_number()
@@ -377,17 +557,22 @@ def generate_word(elements: List[ContentElement], output_path: str):
     # 1. 设置页面格式
     setup_page(doc)
 
-    # 2. 设置默认Normal样式
+    # 1.5 设置页码（第 X 页 共 Y 页）
+    setup_page_number_footer(doc, start_at=1)
+
+    # 2. 设置默认Normal样式（同时设置 ascii/hAnsi/eastAsia/cs 四种字体）
     style = doc.styles['Normal']
     style.font.name = BODY_FONT['en']
     style.font.size = Pt(BODY_FONT['size_pt'])
-    # 安全设置中文字体（w:eastAsia）
     rPr = style.element.get_or_add_rPr()
     rFonts = rPr.find(qn('w:rFonts'))
     if rFonts is None:
         rFonts = OxmlElement('w:rFonts')
         rPr.insert(0, rFonts)
+    rFonts.set(qn('w:ascii'), BODY_FONT['en'])
+    rFonts.set(qn('w:hAnsi'), BODY_FONT['en'])
     rFonts.set(qn('w:eastAsia'), BODY_FONT['cn'])
+    rFonts.set(qn('w:cs'), BODY_FONT['en'])
 
     # 3. 图表编号计数器
     counter = FigureTableCounter()
@@ -423,7 +608,7 @@ def generate_word(elements: List[ContentElement], output_path: str):
 
         else:
             # 正文
-            text = elem.text.strip()
+            text = _clean_text(elem.text.strip())
             if not text:
                 added_counts['skipped_empty'] += 1
                 continue
