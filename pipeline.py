@@ -97,6 +97,24 @@ class PDFToWordPipeline:
 
         logger.info(f"识别到 {heading_count} 个标题")
 
+        # 3.5 后处理：招标文件里的 "X. 中文标题" 列表大项
+        # 这些项 PDF 视觉上是加粗 + 14pt 左右（如"1. 招标条件"），
+        # 但 PyMuPDF 常常检测不到 bold flag，且字体名是 SimSun。
+        # 我们按文本特征强制加粗，并确保字号 >= 14pt。
+        import re as _re
+        _clause_title_re = _re.compile(r'^\d+([\.\．]\d+)?[\.\．\s]*(.+)$')
+        for elem in elements:
+            if elem.type != 'text' or not elem.text:
+                continue
+            t = elem.text.strip()
+            m = _clause_title_re.match(t)
+            if m and len(m.group(2)) <= 12:
+                elem.is_bold = True
+                if elem.mapped_size and elem.mapped_size < 14:
+                    elem.mapped_size = 14.0
+                elif elem.font_size and elem.font_size < 14:
+                    elem.font_size = 14.0
+
         # 0.4 诊断：打印被判为 heading 的段落
         for i, e in enumerate(elements):
             if e.type == 'heading':
