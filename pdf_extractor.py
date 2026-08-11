@@ -322,15 +322,6 @@ def _parse_layout_result(res, page_num: int, page_width: float,
             matched_spans = _find_spans_in_region(page_spans, pdf_bbox)
             style = _aggregate_span_style(matched_spans)
 
-            # 对齐方式：多信号综合判断
-            # 把 PyMuPDF block 的 bbox 优先用上（段落级，比 PP-StructureV3 region bbox 更准）
-            pymupdf_bbox = _get_pymupdf_block_bbox(matched_spans) if matched_spans else None
-            effective_bbox = pymupdf_bbox if pymupdf_bbox else pdf_bbox
-            alignment = _detect_alignment(
-                effective_bbox, page_width, matched_spans,
-                text=text, block_label=block_type, block=block
-            )
-
             # 文本内容：v3 字段是 block_content
             text = (block.get('block_content')
                     or block.get('content')
@@ -350,6 +341,15 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                 text = _re.sub(r'，\s*，', '，', text)
                 text = _re.sub(r'。\s*。', '。', text)
                 text = text.strip()
+
+            # 对齐方式：多信号综合判断（必须在 text 赋值之后调用）
+            # 把 PyMuPDF block 的 bbox 优先用上（段落级，比 PP-StructureV3 region bbox 更准）
+            pymupdf_bbox = _get_pymupdf_block_bbox(matched_spans) if matched_spans else None
+            effective_bbox = pymupdf_bbox if pymupdf_bbox else pdf_bbox
+            alignment = _detect_alignment(
+                effective_bbox, page_width, matched_spans,
+                text=text, block_label=block_type, block=block
+            )
 
             if block_type in ('title', 'paragraph_title', 'heading', 'doc_title'):
                 elements.append(ContentElement(
