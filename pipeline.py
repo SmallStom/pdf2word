@@ -89,6 +89,11 @@ class PDFToWordPipeline:
                     elem.type = 'heading'
                     elem.heading_level = level
                     heading_count += 1
+                    # 固定格式：一级标题居中，二级及以下左对齐
+                    if level == 1:
+                        elem.alignment = 'center'
+                    else:
+                        elem.alignment = 'left'
                 else:
                     # 正文统一使用小四号 12pt（固定格式规范）
                     elem.mapped_size = float(BODY_FONT['size_pt'])
@@ -102,7 +107,7 @@ class PDFToWordPipeline:
                 print(
                     f"[DIAG-HEAD] i={i} level={e.heading_level} "
                     f"font_size={e.font_size} is_bold={e.is_bold} "
-                    f"mapped_size={e.mapped_size} text={t!r}",
+                    f"alignment={e.alignment} mapped_size={e.mapped_size} text={t!r}",
                     flush=True
                 )
 

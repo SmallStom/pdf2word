@@ -291,8 +291,8 @@ def add_body_paragraph(doc: Document, text: str, size_pt: float = None,
                            space_before=BODY_FONT['space_before_pt'],
                            space_after=BODY_FONT['space_after_pt'],
                            snap_to_grid=BODY_FONT['snap_to_grid'])
-    # 首行缩进 2 字符 = 2 * 字号（仅左对齐段落需要，居中/右对齐不应缩进）
-    if alignment == 'left':
+    # 首行缩进 2 字符 = 2 * 字号（仅左对齐正文需要，居中/右对齐/目录条目不缩进）
+    if alignment == 'left' and not _is_toc_entry(text):
         indent_pt = actual_size * BODY_FONT['first_line_indent_chars']
         p.paragraph_format.first_line_indent = Pt(indent_pt)
     if alignment == 'center':
@@ -301,6 +301,15 @@ def add_body_paragraph(doc: Document, text: str, size_pt: float = None,
         p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     else:
         p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+
+def _is_toc_entry(text: str) -> bool:
+    """判断是否为目录条目（含前导点号连接页码）"""
+    if not text:
+        return False
+    # 匹配 "... 12" 或 "…… 12" 或 "..82"
+    return bool(re.search(r'[\.\.]{2,}\s*\d+\s*$', text) or
+                re.search(r'[…⋯]{2,}\s*\d+\s*$', text))
 
 
 # ============================================================

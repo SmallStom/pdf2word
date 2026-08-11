@@ -682,7 +682,8 @@ def _align_from_label(block_label: str = None) -> Optional[str]:
     if not block_label:
         return None
     label_lower = block_label.lower()
-    if label_lower in ('doc_title', 'figure_title', 'table_title',
+    # title/doc_title：封面大标题，强制居中
+    if label_lower in ('title', 'doc_title', 'figure_title', 'table_title',
                         'reference_title', 'algorithm_title'):
         return 'center'
     return None
