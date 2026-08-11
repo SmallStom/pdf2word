@@ -55,6 +55,21 @@ class PDFToWordPipeline:
             preview = e.text[:80].replace('\n', ' ')
             print(f"[DIAG] 样本{i+1} type={e.type} text={preview!r}", flush=True)
 
+        # 0.2.5 诊断：打印"X. 标题"和"X.Y.Z"开头的段落（这些常被误判为 heading）
+        import re as _re
+        number_prefix_re = _re.compile(r'^\d+([\.\．]\d+){0,3}[\.\．\s]')
+        for i, e in enumerate(elements[:200]):
+            if not e.text or not e.text.strip():
+                continue
+            t = e.text.strip()
+            if number_prefix_re.match(t) and len(t) < 80:
+                # 这是疑似"列表项"段落
+                print(
+                    f"[DIAG-LIST] i={i} type={e.type} font_size={e.font_size} "
+                    f"is_bold={e.is_bold} alignment={e.alignment} text={t[:60]!r}",
+                    flush=True
+                )
+
         # 0.3 诊断：表格/图片数量
         tables_with_html = sum(1 for e in elements if e.type == 'table' and e.html)
         images_with_data = sum(1 for e in elements if e.type == 'image' and e.image_data)
@@ -80,6 +95,17 @@ class PDFToWordPipeline:
                     )
 
         logger.info(f"识别到 {heading_count} 个标题")
+
+        # 0.4 诊断：打印被判为 heading 的段落
+        for i, e in enumerate(elements):
+            if e.type == 'heading':
+                t = (e.text or '').strip()[:60]
+                print(
+                    f"[DIAG-HEAD] i={i} level={e.heading_level} "
+                    f"font_size={e.font_size} is_bold={e.is_bold} "
+                    f"mapped_size={e.mapped_size} text={t!r}",
+                    flush=True
+                )
 
         # 4. 生成Word文档
         logger.info("开始生成Word文档...")
