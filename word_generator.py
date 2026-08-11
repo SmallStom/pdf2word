@@ -393,31 +393,44 @@ def generate_word(elements: List[ContentElement], output_path: str):
     counter = FigureTableCounter()
 
     # 4. 遍历内容元素
+    import logging
+    _log = logging.getLogger(__name__)
+    added_counts = {'heading': 0, 'text': 0, 'table': 0, 'image': 0, 'skipped_empty': 0, 'skipped_header': 0}
     for elem in elements:
         if elem.type == 'heading':
             # 更新章节号
             counter.update_chapter(elem.text, elem.heading_level or 1)
             # 添加标题
-            add_heading(doc, elem.text, elem.heading_level or 1)
+            if elem.text and elem.text.strip():
+                add_heading(doc, elem.text, elem.heading_level or 1)
+                added_counts['heading'] += 1
 
         elif elem.type == 'table':
             # 添加表格
             if elem.html:
                 add_table(doc, elem.html, counter)
+                added_counts['table'] += 1
+            else:
+                _log.warning(f"[DIAG-gen] 表格被跳过：无 html, text={elem.text[:50]!r}")
 
         elif elem.type == 'image':
             # 添加图片
             if elem.image_data:
                 add_image(doc, elem.image_data, counter)
+                added_counts['image'] += 1
+            else:
+                _log.warning(f"[DIAG-gen] 图片被跳过：无 image_data, text={elem.text[:50]!r}")
 
         else:
             # 正文
             text = elem.text.strip()
             if not text:
+                added_counts['skipped_empty'] += 1
                 continue
 
             # 过滤明显是页眉页脚的内容：单独成行且极短、纯数字
             if _is_likely_header_footer(text):
+                added_counts['skipped_header'] += 1
                 continue
 
             add_body_paragraph(
@@ -426,6 +439,9 @@ def generate_word(elements: List[ContentElement], output_path: str):
                 alignment=elem.alignment or 'left',
                 bold=bool(elem.is_bold),
             )
+            added_counts['text'] += 1
+
+    _log.info(f"[DIAG-gen] 生成统计: {added_counts}")
 
     # 5. 保存文档
     doc.save(output_path)
