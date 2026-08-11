@@ -556,34 +556,37 @@ def _detect_alignment(bbox, page_width, spans: List[Dict] = None,
 
     信号优先级（从强到弱）：
     1. PP-StructureV3 block 自带 alignment（v3 字段最可靠）
-    2. 文本特征（短文本、特殊符号、独立日期等 → 居中/右对齐的概率大）
-    3. block_label 暗示（doc_title/figure_title/table_title 多居中）
-    4. block bbox 几何（段落级，比 span 稳定）
-    5. span 检测（仅在 span 很多时用，span 少噪声大）
+    2. block bbox 几何（段落级，重要）
+    3. span 检测（取第一行，抗 wrap 干扰）
+    4. block_label 暗示（仅 doc_title 等明确类型）
+    5. 文本特征规则（最保守，仅特殊模式）
     """
     # ---- 信号1：block 自带 alignment（最可靠）----
     block_align = _extract_block_alignment(block) if block else None
     if block_align:
         return block_align
 
-    # ---- 信号2：文本特征（基于经验规则）----
-    feature_align = _detect_alignment_from_features(text, block_label)
-    if feature_align:
-        return feature_align
+    # ---- 信号2：block bbox 几何（段落级）----
+    bbox_align = _detect_alignment_from_bbox(bbox, page_width)
+    if bbox_align in ('center', 'right'):
+        return bbox_align
 
-    # ---- 信号3：block_label 暗示 ----
+    # ---- 信号3：span 检测（取第一行）----
+    # 1 个 span 也能判（长标题），但只信任 center/right 结果
+    if spans and len(spans) >= 1:
+        span_align = _detect_alignment_from_spans(spans, page_width)
+        if span_align in ('center', 'right'):
+            return span_align
+
+    # ---- 信号4：block_label 暗示（仅明确类型）----
     label_align = _align_from_label(block_label)
     if label_align:
         return label_align
 
-    # ---- 信号4：block bbox 几何（段落级，比 span 稳定）----
-    bbox_align = _detect_alignment_from_bbox(bbox, page_width)
-    if bbox_align != 'left':
-        return bbox_align
-
-    # ---- 信号5：span 检测（仅在 span 很多时用）----
-    if spans and len(spans) >= 5:
-        return _detect_alignment_from_spans(spans, page_width)
+    # ---- 信号5：文本特征（最保守）----
+    feature_align = _detect_alignment_from_features(text, block_label)
+    if feature_align:
+        return feature_align
 
     return 'left'
 
@@ -605,10 +608,10 @@ def _get_pymupdf_block_bbox(spans: List[Dict]) -> Optional[List[float]]:
 def _detect_alignment_from_features(text: str, block_label: str = None) -> Optional[str]:
     """根据文本特征推断对齐方式
 
-    经验规则：
-    - 极短文本（<= 8 字符）且非纯数字 → 标题/图名，多居中
-    - 居中常见模式：日期（YYYY年M月D日）、单独数字（页码/编号）、书名号内容
-    - 右对齐常见模式：日期、签名、版本号
+    谨慎的规则——只在很确定的情况下判 center/right：
+    - block_label 是 doc_title/figure_title 等"已知居中类型" + 短文本 → center
+    - 落款日期（YYYY年M月D日）+ 文本很短（<= 12字符）→ right（落款常用）
+    - 不再使用"句末标点"等过激规则
     """
     if not text:
         return None
@@ -616,40 +619,42 @@ def _detect_alignment_from_features(text: str, block_label: str = None) -> Optio
     if not text:
         return None
 
-    # 规则1：超短文本（<= 8 字符）很可能是标题/图名/页码 → 居中
-    if len(text) <= 8 and not re.match(r'^[\s\d.。,，:：;；、\-—]+$', text):
-        # 排除纯数字（那是页码之类）
-        if not text.isdigit():
-            return 'center'
+    # 规则1：仅当 block_label 明确是"标题型"时，短文本才判 center
+    if block_label:
+        label_lower = block_label.lower()
+        if label_lower in ('doc_title', 'figure_title', 'table_title',
+                            'reference_title', 'algorithm_title'):
+            if len(text) <= 30:  # 标题都比较短
+                return 'center'
 
-    # 规则2：日期模式 → 居中或右对齐
-    if re.match(r'^\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*$', text):
-        return 'center'  # 单飞日期多居中
-    if re.match(r'^[一二三四五六七八九十0-9]{4}年[一二三四五六七八九十0-9]{1,2}月$', text):
-        return 'center'
-
-    # 规则3：独立数字（1-4 位）→ 居中
+    # 规则2：纯数字独立成段（页码）→ center
     if re.match(r'^\d{1,4}$', text):
         return 'center'
 
-    # 规则4：句号/问号/感叹号结尾的短句 → 可能是引用或独立段
-    if len(text) <= 15 and re.search(r'[。！？]$', text) and len(text) <= 12:
-        return 'center'
+    # 规则3：落款日期（短，整行）→ right
+    if re.match(r'^\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日\s*$', text) and len(text) <= 12:
+        return 'right'
+    if re.match(r'^[一二三四五六七八九十0-9]{4}年[一二三四五六七八九十0-9]{1,2}月[一二三四五六七八九十0-9]{1,2}日$', text):
+        return 'right'
 
+    # 其他情况不强行判，返回 None 让 bbox/span 接管
     return None
 
 
 def _align_from_label(block_label: str = None) -> Optional[str]:
-    """根据 block_label 推断对齐"""
+    """根据 block_label 推断对齐
+
+    只在结构明确时判 center：
+    - doc_title / figure_title / table_title / reference_title / algorithm_title
+    - paragraph_title（一级章节标题如"第三章 评标办法..."）
+    其他 label 不强行判（避免把正文误判居中）
+    """
     if not block_label:
         return None
     label_lower = block_label.lower()
     # 几乎都居中的类型
     if label_lower in ('doc_title', 'figure_title', 'table_title',
-                        'reference_title', 'algorithm_title', 'header', 'footer'):
-        return 'center'
-    # 经常居中的类型
-    if label_lower in ('paragraph_title', 'abstract_title'):
+                        'reference_title', 'algorithm_title', 'paragraph_title'):
         return 'center'
     return None
 
@@ -658,7 +663,8 @@ def _detect_alignment_from_bbox(bbox, page_width) -> str:
     """block bbox 几何检测（段落级，比 span 稳定）
 
     关键改进：
-    - 居中要求：左右 margin 接近 + 段落宽度 < 90% 页宽
+    - 居中要求：左右 margin 接近 + 段落宽度 < 85% 页宽
+    - 但还要"两侧都明显大于页边距"才判 center（否则是左对齐段落）
     - 右对齐要求：右 margin 极小 + 左 margin 显著 > 0
     - 段落宽度 >= 90% 页宽 → 几乎都是左对齐
     """
@@ -674,8 +680,13 @@ def _detect_alignment_from_bbox(bbox, page_width) -> str:
     if elem_width > page_width * 0.9:
         return 'left'
 
-    # 居中：左右 margin 接近
-    if abs(left - right) < tol and elem_width < page_width * 0.85:
+    # 居中：左右 margin 接近 + 两侧 margin 都明显大于页边距（> 25% 页宽）
+    # 关键：左对齐段落的 left 就是页边距（通常 75-110pt = 13-18% 页宽）
+    # 所以要求两侧 margin 都 > 25% 页宽（150pt）才判 center
+    if (abs(left - right) < tol
+        and elem_width < page_width * 0.85
+        and left > page_width * 0.25
+        and right > page_width * 0.25):
         return 'center'
 
     # 右对齐：右边贴页边距，左边留大空白
