@@ -10,6 +10,8 @@ __pycache__/
 *.log
 tmp/
 temp/
+# PaddleX 模型缓存（避免 1-2GB 模型被打进镜像层）
+models/
 .models/
 .DS_Store
 Thumbs.db
