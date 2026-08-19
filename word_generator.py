@@ -80,12 +80,6 @@ def _clean_text(text: str) -> str:
     text = re.sub(r'(https?|ftp)\s*[：:]\s*/\s*/\s*', r'\1://', text)
     text = re.sub(r'([：:])\s*/\s*/\s*', r'://', text)
 
-    # 中文之间夹的半角空格 → 去掉（只处理"中文 中文"模式）
-    # 保留"中 1.0"等有意义空格
-    text = re.sub(r'([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])', r'\1\2', text)
-
-    # 修复 "第X章" 后多余空格
-    text = re.sub(r'^(第\s*[零一二三四五六七八九十百千0-9]+\s*[章部分编篇节条款])\s+', r'\1', text)
     # "1.1" 后面多余空格
     text = re.sub(r'^(\d+(?:\.\d+)+)\s{2,}', r'\1 ', text)
 

@@ -193,7 +193,10 @@ def extract_with_layout_analysis(pdf_path: str, dpi: int = 200) -> List[ContentE
             # 2. PyMuPDF 提取 spans（字体/字号/粗体）
             page_spans = _extract_page_spans(page)
 
-            # 2.5 PyMuPDF 表格检测（数字版PDF可用，用于纠正OCR表格HTML）
+            # 2.5 PyMuPDF 段落级文本块（用于合并被版面分析切碎的片段）
+            page_blocks = _extract_page_text_blocks(page)
+
+            # 2.6 PyMuPDF 表格检测（数字版PDF可用，用于纠正OCR表格HTML）
             page_tables = _extract_page_tables(page)
 
             # 3. PP-StructureV3 版面分析（接受文件路径）
@@ -217,10 +220,11 @@ def extract_with_layout_analysis(pdf_path: str, dpi: int = 200) -> List[ContentE
                 logger.warning(f"[WARN] 第{page_num+1}页无版面结果，跳过")
                 continue
 
-            # 5. 从每个 res (整页) 中提取 ContentElement
+            # 5. 从每个 res (整页) 中提取 ContentElement，并按 PyMuPDF 段落块合并碎片
             for res in results:
                 page_elems = _parse_layout_result(
-                    res, page_num, page_width, page_height, scale, page_spans, page_tables
+                    res, page_num, page_width, page_height, scale,
+                    page_spans, page_tables, page_blocks
                 )
                 elements.extend(page_elems)
 
@@ -246,7 +250,8 @@ def extract_with_layout_analysis(pdf_path: str, dpi: int = 200) -> List[ContentE
 def _parse_layout_result(res, page_num: int, page_width: float,
                           page_height: float, scale: float,
                           page_spans: List[Dict],
-                          page_tables: List[Dict] = None) -> List[ContentElement]:
+                          page_tables: List[Dict] = None,
+                          page_blocks: List[Dict] = None) -> List[ContentElement]:
     """从 LayoutParsingResultV2 解析出 ContentElement 列表
 
     res 可能是以下之一：
@@ -343,11 +348,8 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                 # 修复全角冒号/斜杠（在 URL 场景）
                 text = _re.sub(r'(https?|ftp)\s*[：:]\s*/\s*/\s*', r'\1://', text)
                 text = _re.sub(r'([：:])\s*/\s*/\s*', r'://', text)
-                # 中文之间的半角空格去掉（仅 OCR 文本需要；span 文本已精确保留空格）
-                if not used_span_text:
-                    text = _re.sub(r'([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])', r'\1\2', text)
-                # 修复"第X章"后多余空格
-                text = _re.sub(r'^(第\s*[零一二三四五六七八九十百千0-9]+\s*[章部分编篇节条款])\s+', r'\1', text)
+                # "1.1" 后面多余空格
+                text = _re.sub(r'^(\d+(?:\.\d+)+)\s{2,}', r'\1 ', text)
                 # 修复连续标点
                 text = _re.sub(r'，\s*，', '，', text)
                 text = _re.sub(r'。\s*。', '。', text)
@@ -474,6 +476,10 @@ def _parse_layout_result(res, page_num: int, page_width: float,
 
     else:
         logger.warning(f"[WARN] 未知的 res 结构，keys: {list(inner.keys())[:10]}")
+
+    # 6. 按 PyMuPDF 段落级文本块合并被 PP-StructureV3 切碎的文本片段
+    if page_blocks:
+        elements = _merge_elements_by_text_blocks(elements, page_blocks, page_width)
 
     return elements
 
@@ -634,6 +640,23 @@ def _extract_page_spans(page) -> List[Dict]:
     return spans
 
 
+def _extract_page_text_blocks(page) -> List[Dict]:
+    """用 PyMuPDF 提取段落级文本块（用于合并被版面分析切碎的片段）"""
+    blocks = []
+    try:
+        for b in page.get_text("blocks"):
+            if len(b) < 5:
+                continue
+            x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4]
+            text = (text or '').strip()
+            if not text:
+                continue
+            blocks.append({'bbox': [float(x0), float(y0), float(x1), float(y1)], 'text': text})
+    except Exception:
+        pass
+    return blocks
+
+
 def _is_bold_font_name(font_name: str) -> bool:
     """从字体名识别粗体
 
@@ -706,6 +729,131 @@ def _aggregate_span_style(spans: List[Dict]) -> Dict:
         'is_bold': is_bold,
         'is_italic': is_italic,
     }
+
+
+def _union_bbox(a: List[float], b: List[float]) -> List[float]:
+    """合并两个 bbox"""
+    return [min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])]
+
+
+def _merge_elements_by_text_blocks(elements: List[ContentElement],
+                                   blocks: List[Dict],
+                                   page_width: float) -> List[ContentElement]:
+    """根据 PyMuPDF 段落级文本块，合并被版面分析切碎的同行/同段文本片段
+
+    PP-StructureV3 对数字版PDF经常过度切分：一个标题/段落被拆成
+    "1"、"."、"招标条件" 等多个 block。PyMuPDF 的 get_text("blocks")
+    能给出原始段落划分，因此把落在同一段落 block 里的碎片合并回
+    一个 ContentElement，并用 block 的完整文本作为权威文本。
+    """
+    if not elements or not blocks:
+        return elements
+
+    def _match_block(elem: ContentElement):
+        if not elem.bbox or len(elem.bbox) != 4:
+            return None, 0.0
+        ex1, ey1, ex2, ey2 = elem.bbox
+        earea = (ex2 - ex1) * (ey2 - ey1)
+        if earea <= 0:
+            return None, 0.0
+        best = None
+        best_ratio = 0.0
+        for blk in blocks:
+            bx1, by1, bx2, by2 = blk['bbox']
+            ox1, oy1 = max(ex1, bx1), max(ey1, by1)
+            ox2, oy2 = min(ex2, bx2), min(ey2, by2)
+            if ox1 < ox2 and oy1 < oy2:
+                inter = (ox2 - ox1) * (oy2 - oy1)
+                ratio = inter / earea
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best = blk
+        return best, best_ratio
+
+    merged: List[ContentElement] = []
+    current: Optional[ContentElement] = None
+    current_block: Optional[Dict] = None
+    acc_size = 0.0
+    acc_weight = 0
+    acc_bold = 0
+    acc_italic = 0
+    font_counter: Dict[Optional[str], int] = {}
+
+    def _flush():
+        nonlocal current, current_block, acc_size, acc_weight, acc_bold, acc_italic, font_counter
+        if current is not None:
+            if acc_weight > 0:
+                current.font_size = acc_size / acc_weight
+            current.is_bold = acc_bold > acc_weight / 2 if acc_weight else False
+            current.is_italic = acc_italic > acc_weight / 2 if acc_weight else False
+            if font_counter:
+                current.font_name = max(font_counter, key=font_counter.get)
+            current.alignment = _detect_alignment_from_bbox(current.bbox, page_width)
+            merged.append(current)
+        current = None
+        current_block = None
+        acc_size = 0.0
+        acc_weight = 0
+        acc_bold = 0
+        acc_italic = 0
+        font_counter = {}
+
+    for elem in elements:
+        if elem.type not in ('text', 'heading') or not elem.bbox:
+            _flush()
+            merged.append(elem)
+            continue
+
+        block, ratio = _match_block(elem)
+        if not block or ratio < 0.5:
+            _flush()
+            merged.append(elem)
+            continue
+
+        w = len((elem.text or '').strip())
+        if current_block is not None and current_block is block:
+            # 同一 PyMuPDF 段落块：合并到当前元素
+            current.bbox = _union_bbox(current.bbox, elem.bbox)
+            current.text = block['text']  # 用 PyMuPDF 段落完整文本作为权威文本
+            if elem.type == 'heading':
+                current.type = 'heading'
+            if elem.font_size and w > 0:
+                acc_size += elem.font_size * w
+                acc_weight += w
+            if elem.is_bold:
+                acc_bold += w
+            if elem.is_italic:
+                acc_italic += w
+            if elem.font_name:
+                font_counter[elem.font_name] = font_counter.get(elem.font_name, 0) + w
+        else:
+            _flush()
+            current = ContentElement(
+                type=elem.type,
+                text=block['text'],
+                bbox=elem.bbox[:],
+                page_num=elem.page_num,
+                font_name=elem.font_name,
+                font_size=elem.font_size,
+                is_bold=elem.is_bold,
+                is_italic=elem.is_italic,
+                alignment=_detect_alignment_from_bbox(elem.bbox, page_width),
+            )
+            current_block = block
+            if elem.font_size and w > 0:
+                acc_size = elem.font_size * w
+                acc_weight = w
+            else:
+                acc_size = 0.0
+                acc_weight = 0
+            acc_bold = w if elem.is_bold else 0
+            acc_italic = w if elem.is_italic else 0
+            font_counter = {}
+            if elem.font_name:
+                font_counter[elem.font_name] = w
+
+    _flush()
+    return merged
 
 
 def _detect_alignment(bbox, page_width, spans: List[Dict] = None,
