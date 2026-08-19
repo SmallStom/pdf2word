@@ -555,7 +555,9 @@ def _build_span_text(spans: List[Dict]) -> str:
     """把 PyMuPDF span 按行聚合成段落文本（数字版PDF的精确文本）
 
     PyMuPDF span 直接来自 PDF 内容流，能完整保留空格、下划线、全半角字符。
-    按视觉行分组（y坐标相近），行内按 x 坐标从左到右拼接，行间用空格连接。
+    按视觉行分组（y坐标相近），行内按 x 坐标从左到右拼接。
+    行与行之间用换行('\n')连接，保留原文行的结构（OCR 的 block_content 也是
+    用 '\n' 分隔行的，两者保持一致），而不是用空格把多行并成一行。
     """
     if not spans:
         return ''
@@ -573,7 +575,7 @@ def _build_span_text(spans: List[Dict]) -> str:
         line_text = line_text.strip()
         if line_text:
             parts.append(line_text)
-    return ' '.join(parts)
+    return '\n'.join(parts)
 
 
 def _choose_best_text(ocr_text: str, span_text: str) -> Tuple[str, bool]:

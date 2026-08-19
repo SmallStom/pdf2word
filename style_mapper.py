@@ -62,68 +62,40 @@ def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]
 
     font_size = elem.font_size
     is_bold = elem.is_bold
+    is_layout_heading = elem.type == 'heading'
 
-    # ---- 信号1：文本模式匹配（最可靠，PP-StructureV3的字号不准）----
+    # ---- 信号1：文本模式匹配（最可靠，尤其一级"第X章"）----
     pattern_level = _match_heading_pattern(text)
-
-    # ---- 信号2：版面分析已识别为标题 ----
-    layout_level = None
-    if elem.type == 'heading':
-        if pattern_level:
-            layout_level = pattern_level
-        else:
-            layout_level = 1  # 默认 1 级
-
-    # ---- 信号3：字号判断 ----
-    # 关键：仅当字号 >= 15pt 且加粗时才判 heading
-    # 14pt 加粗（如"1. 招标条件"列表大项）不算 heading（太接近正文）
-    size_level = None
-    if font_size and font_size > 0 and is_bold:
-        if body_size > 0 and font_size <= body_size + 0.5:
-            # 字号与正文相当 → 不是标题
-            size_level = None
-        elif font_size >= 18:
-            size_level = 1
-        elif font_size >= 16:
-            size_level = 2
-        elif font_size >= 15:
-            size_level = 3
-        # 14pt 加粗不算 heading（"1. 招标条件" 这种列表项的典型字号）
-
-    # ---- 信号4：加粗+字号大于正文 ----
-    # 关键：仅当字号 > 正文时才可能是标题；加粗但字号 < 正文是普通加粗正文
-    bold_level = None
-    if is_bold and body_size > 0 and font_size:
-        if font_size <= body_size:
-            # 字号 <= 正文：加粗的正文，不是标题
-            bold_level = None
-        else:
-            ratio = font_size / body_size
-            if ratio >= 1.3:
-                bold_level = 1
-            elif ratio >= 1.15:
-                bold_level = 2
-            elif ratio >= 1.05:
-                bold_level = 3
-            else:
-                bold_level = None  # 字号接近正文，不算标题
-
-    # ---- 融合决策 ----
-    # 文本模式最可靠，直接用
     if pattern_level:
         return pattern_level
 
-    # 版面分析识别为标题
-    if layout_level:
-        return layout_level
+    # ---- 以下无文本模式，用字号保守判断 ----
+    # 关键：版面"heading"不再默认标为一级，避免普通小节标题被误判为
+    # 一级标题而另起一页。是否一级只看字号是否显著大于正文。
+    if not font_size or font_size <= 0:
+        # 无字号信息（扫描件或缺span）：仅当版面明确判为标题时给中等层级，
+        # 避免漏掉真实标题，但也绝不默认成一级
+        return 3 if is_layout_heading else None
 
-    # 纯字号判断
-    if size_level:
-        return size_level
+    if body_size and body_size > 0 and font_size <= body_size + 0.5:
+        # 字号与正文相当 → 大概率是加粗正文/列表大项，不是标题
+        return None
 
-    if bold_level:
-        return bold_level
-
+    scale = font_size / body_size if body_size and body_size > 0 else 1.0
+    # 一级标题需要非常显著的证据（大字号，或明显大于正文倍数）
+    if is_bold:
+        if font_size >= 18 or scale >= 1.5:
+            return 1
+        if font_size >= 16 or scale >= 1.25:
+            return 2
+        if font_size >= 14 or scale >= 1.1:
+            return 3
+        return None
+    # 非加粗：只有明显大于正文才算标题
+    if scale >= 1.4:
+        return 1
+    if scale >= 1.2:
+        return 2
     return None
 
 
