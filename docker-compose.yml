@@ -28,11 +28,13 @@ services:
       - CUDA_VISIBLE_DEVICES=2
       # GPU显存限制（GB），显卡共享时修改此值
       - PADDLE_GPU_MEMORY_GB=4
+      # 模型缓存目录：与下方 bind mount 目标一致，保证下载到 host 的 ./models
+      - PADDLE_PDX_CACHE_HOME=/root/.paddlex
       # 限制只处理前N页（验证阶段设小，正式用删掉此行或设为0）
       - MAX_PAGES=10
     volumes:
       - pdf2word_temp:/tmp/pdf2word
-      # PaddleX 模型缓存：绑定挂载到当前目录的 .models 子目录
+      # PaddleX 模型缓存：绑定挂载到当前目录的 models 子目录
       # （也可以改成命名卷，但 bind mount 可以直接用 ls 看到、备份、删除）
       - ./models:/root/.paddlex
     restart: unless-stopped
@@ -59,9 +61,10 @@ services:
       - PORT=8000
       - HF_ENDPOINT=https://hf-mirror.com
       - PADDLE_DEVICE=cpu
+      - PADDLE_PDX_CACHE_HOME=/root/.paddlex
     volumes:
       - pdf2word_temp:/tmp/pdf2word
-      - ./.models:/root/.paddlex
+      - ./models:/root/.paddlex
     restart: unless-stopped
 
 volumes:

@@ -161,21 +161,21 @@ docker run -d -p 8000:8000 --name pdf2word pdf2word
 
 ### 模型缓存（绑定挂载）
 
-PaddleX 模型默认缓存在 `~/.paddlex/official_models/`，**docker-compose.yml 已绑定挂载到当前目录的 `./.models/` 子目录**（不是命名卷），这样可以直接 `ls` 看到、备份、删除。
+PaddleX 模型默认缓存在 `~/.paddlex/official_models/`，**docker-compose.yml 已绑定挂载到当前目录的 `./models/` 子目录**（不是命名卷），这样可以直接 `ls` 看到、备份、删除。
 
-- **首次启动**：容器内检测到 `./.models/` 为空，会自动从百度云下载模型到 `./.models/`（约 1-2GB，需 5-15 分钟）
-- **后续启动**：直接复用 `./.models/` 中的模型，秒级就绪
-- **重建镜像**：`docker-compose build --no-cache` 不会影响 `./.models/`，模型不丢
-- **迁移到其他机器**：直接 `scp -r ./.models/ user@new-server:/path/`
+- **首次启动**：容器内检测到 `models/` 为空，会自动下载模型到 `models/`（约 1-2GB，需 5-15 分钟）
+- **后续启动**：直接复用 `models/` 中的模型，秒级就绪
+- **重建镜像**：`docker-compose build --no-cache` 不会影响 `models/`，模型不丢
+- **迁移到其他机器**：直接 `scp -r models/ user@new-server:/path/`
 
 ```bash
 # 查看模型缓存大小
-du -sh ./.models/
+du -sh models/
 
 # 删除模型（下次启动会重新下载）
-rm -rf ./.models/
+rm -rf models/
 
-# 把 .models/ 加入 .gitignore（已默认忽略）
+# 把 models/ 加入 .gitignore（已默认忽略）
 # 见 .gitignore
 ```
 
