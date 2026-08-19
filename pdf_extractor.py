@@ -193,6 +193,9 @@ def extract_with_layout_analysis(pdf_path: str, dpi: int = 200) -> List[ContentE
             # 2. PyMuPDF 提取 spans（字体/字号/粗体）
             page_spans = _extract_page_spans(page)
 
+            # 2.5 PyMuPDF 表格检测（数字版PDF可用，用于纠正OCR表格HTML）
+            page_tables = _extract_page_tables(page)
+
             # 3. PP-StructureV3 版面分析（接受文件路径）
             t0 = time.time()
             try:
@@ -217,7 +220,7 @@ def extract_with_layout_analysis(pdf_path: str, dpi: int = 200) -> List[ContentE
             # 5. 从每个 res (整页) 中提取 ContentElement
             for res in results:
                 page_elems = _parse_layout_result(
-                    res, page_num, page_width, page_height, scale, page_spans
+                    res, page_num, page_width, page_height, scale, page_spans, page_tables
                 )
                 elements.extend(page_elems)
 
@@ -242,7 +245,8 @@ def extract_with_layout_analysis(pdf_path: str, dpi: int = 200) -> List[ContentE
 # ============================================================
 def _parse_layout_result(res, page_num: int, page_width: float,
                           page_height: float, scale: float,
-                          page_spans: List[Dict]) -> List[ContentElement]:
+                          page_spans: List[Dict],
+                          page_tables: List[Dict] = None) -> List[ContentElement]:
     """从 LayoutParsingResultV2 解析出 ContentElement 列表
 
     res 可能是以下之一：
@@ -323,23 +327,33 @@ def _parse_layout_result(res, page_num: int, page_width: float,
             style = _aggregate_span_style(matched_spans)
 
             # 文本内容：v3 字段是 block_content
-            text = (block.get('block_content')
-                    or block.get('content')
-                    or block.get('text')
-                    or '')
-            # 清理 OCR 错误（半全角混用、连续标点等）
+            ocr_text = (block.get('block_content')
+                        or block.get('content')
+                        or block.get('text')
+                        or '')
+            # 数字版PDF优先用 PyMuPDF span 文本（精确保留空格/下划线/全半角），
+            # OCR 可能丢失或错误处理这些字符；扫描件无 span，退回 OCR 文本
+            span_text = _build_span_text(matched_spans)
+            text, used_span_text = _choose_best_text(ocr_text, span_text)
+            # 清理 OCR 错误（半全角混用、连续标点等）+ 统一换行格式
             if text:
                 import re as _re
+                # 统一换行格式：\r\n / \r 都归一为 \n
+                text = _re.sub(r'\r\n?', '\n', text)
                 # 修复全角冒号/斜杠（在 URL 场景）
                 text = _re.sub(r'(https?|ftp)\s*[：:]\s*/\s*/\s*', r'\1://', text)
                 text = _re.sub(r'([：:])\s*/\s*/\s*', r'://', text)
-                # 中文之间的半角空格去掉
-                text = _re.sub(r'([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])', r'\1\2', text)
+                # 中文之间的半角空格去掉（仅 OCR 文本需要；span 文本已精确保留空格）
+                if not used_span_text:
+                    text = _re.sub(r'([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])', r'\1\2', text)
                 # 修复"第X章"后多余空格
                 text = _re.sub(r'^(第\s*[零一二三四五六七八九十百千0-9]+\s*[章部分编篇节条款])\s+', r'\1', text)
                 # 修复连续标点
                 text = _re.sub(r'，\s*，', '，', text)
                 text = _re.sub(r'。\s*。', '。', text)
+                # 换行：连续多个 \n 压缩为一个，行首行尾去空白
+                text = _re.sub(r'\n\s*\n+', '\n', text)
+                text = '\n'.join(line.strip() for line in text.split('\n'))
                 text = text.strip()
 
             # 对齐方式：多信号综合判断（必须在 text 赋值之后调用）
@@ -387,6 +401,11 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                 html = (block.get('pred_html')
                         or block.get('html')
                         or '')
+                # 数字版PDF：若 PyMuPDF 检测到对应的真实表格，优先用它生成更准的 HTML
+                # （OCR 表格识别常出错：漏列、错字、单元格错位）
+                pt_table = _match_pymupdf_table(pdf_bbox, page_tables)
+                if pt_table and pt_table.get('rows'):
+                    html = _rows_to_html(pt_table['rows'])
                 if not html and 'table_ocr_pred' in block:
                     # 拼装简化 HTML
                     html = _build_simple_table_html(block.get('table_ocr_pred', {}))
@@ -470,6 +489,113 @@ def _build_simple_table_html(table_ocr_pred: Dict) -> str:
     for txt in rec_texts:
         rows_html += f'<tr><td>{txt}</td></tr>'
     return f'<table>{rows_html}</table>'
+
+
+def _extract_page_tables(page) -> List[Dict]:
+    """用 PyMuPDF 检测数字版PDF的表格（结构通常比OCR准确）"""
+    tables = []
+    try:
+        finder = page.find_tables()
+        for t in finder.tables:
+            try:
+                rows = t.extract()
+            except Exception:
+                rows = []
+            if not rows:
+                continue
+            # t.bbox 是 PyMuPDF Rect，转成 list
+            bb = list(t.bbox)
+            if len(bb) != 4:
+                continue
+            tables.append({'bbox': bb, 'rows': rows})
+    except Exception:
+        pass
+    return tables
+
+
+def _match_pymupdf_table(bbox, tables: List[Dict]) -> Optional[Dict]:
+    """按 bbox 重叠率匹配 PyMuPDF 检测到的表格（返回重叠度最高且>=0.5的）"""
+    if not tables or not bbox or len(bbox) != 4:
+        return None
+    rx1, ry1, rx2, ry2 = bbox
+    area = (rx2 - rx1) * (ry2 - ry1)
+    if area <= 0:
+        return None
+    best = None
+    best_ratio = 0.0
+    for t in tables:
+        bx1, by1, bx2, by2 = t['bbox']
+        ox1, oy1 = max(rx1, bx1), max(ry1, by1)
+        ox2, oy2 = min(rx2, bx2), min(ry2, by2)
+        if ox1 < ox2 and oy1 < oy2:
+            inter = (ox2 - ox1) * (oy2 - oy1)
+            ratio = inter / area
+            if ratio > best_ratio:
+                best, best_ratio = t, ratio
+    return best if best_ratio >= 0.5 else None
+
+
+def _rows_to_html(rows: List[list]) -> str:
+    """把 PyMuPDF 表格行数据转成简单 HTML 表格"""
+    html_rows = []
+    for row in rows:
+        cells = []
+        for cell in row:
+            if cell is None:
+                cell = ''
+            cell_text = str(cell).strip().replace('\n', ' ')
+            # 避免把 HTML 标签当文本
+            cell_text = cell_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            cells.append(f'<td>{cell_text}</td>')
+        html_rows.append('<tr>' + ''.join(cells) + '</tr>')
+    return '<table>' + ''.join(html_rows) + '</table>'
+
+
+def _build_span_text(spans: List[Dict]) -> str:
+    """把 PyMuPDF span 按行聚合成段落文本（数字版PDF的精确文本）
+
+    PyMuPDF span 直接来自 PDF 内容流，能完整保留空格、下划线、全半角字符。
+    按视觉行分组（y坐标相近），行内按 x 坐标从左到右拼接，行间用空格连接。
+    """
+    if not spans:
+        return ''
+    # 按 y 坐标分组（同一视觉行）
+    line_map: Dict[float, List[Dict]] = {}
+    for s in spans:
+        key = round(s['bbox'][1], 1)
+        line_map.setdefault(key, []).append(s)
+
+    parts = []
+    for y in sorted(line_map):
+        line_spans = sorted(line_map[y], key=lambda s: s['bbox'][0])
+        # 行内逐个 span 拼接（保留 span 内部文本原样，空格保留）
+        line_text = ''.join(s['text'] for s in line_spans)
+        line_text = line_text.strip()
+        if line_text:
+            parts.append(line_text)
+    return ' '.join(parts)
+
+
+def _choose_best_text(ocr_text: str, span_text: str) -> Tuple[str, bool]:
+    """在 OCR 文本与 PyMuPDF span 文本之间选择更可靠的一个
+
+    返回 (text, used_span_text)。
+    - span 文本是数字版PDF的精确文本，优先使用
+    - 但若 span 文本明显过短（region 匹配不全），退回 OCR
+    """
+    ocr_text = (ocr_text or '').strip()
+    span_text = (span_text or '').strip()
+    if not span_text:
+        return ocr_text, False
+
+    span_significant = len(re.sub(r'\s', '', span_text))
+    ocr_significant = len(re.sub(r'\s', '', ocr_text))
+    if ocr_significant == 0:
+        return span_text, True
+    # span 有效字符 >= OCR 的 60% 则可信（防止 span 截断）
+    if span_significant >= ocr_significant * 0.6:
+        return span_text, True
+    return ocr_text, False
 
 
 # ============================================================

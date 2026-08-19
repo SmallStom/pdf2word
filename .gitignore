@@ -35,3 +35,4 @@ venv/
 # Docker volumes
 paddleocr_models/
 .models/
+models/

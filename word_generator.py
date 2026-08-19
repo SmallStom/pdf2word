@@ -64,6 +64,7 @@ def _is_likely_header_footer(text: str) -> bool:
 def _clean_text(text: str) -> str:
     """清理文本中的常见 OCR 错误和半全角混用
 
+    - 统一换行格式：\r\n / \r → \n
     - 修复 https：// → https://
     - 合并多余半角空格
     - 修复 "第二章 投标人须知" 这种"中文标题+半角空格+中文"
@@ -71,6 +72,9 @@ def _clean_text(text: str) -> str:
     if not text:
         return text
     text = text.strip()
+
+    # 统一换行格式
+    text = re.sub(r'\r\n?', '\n', text)
 
     # 修复全角冒号/斜杠（在 URL 场景）
     text = re.sub(r'(https?|ftp)\s*[：:]\s*/\s*/\s*', r'\1://', text)
@@ -88,6 +92,10 @@ def _clean_text(text: str) -> str:
     # 修复连续标点
     text = re.sub(r'，\s*，', '，', text)
     text = re.sub(r'。\s*。', '。', text)
+
+    # 统一内部换行：连续 \n 压缩，行首行尾去空白
+    text = re.sub(r'\n\s*\n+', '\n', text)
+    text = '\n'.join(line.strip() for line in text.split('\n'))
 
     return text.strip()
 
@@ -315,12 +323,14 @@ def _is_toc_entry(text: str) -> bool:
 # ============================================================
 # 标题段落
 # ============================================================
-def add_heading(doc: Document, text: str, level: int, alignment: str = 'left'):
+def add_heading(doc: Document, text: str, level: int, alignment: str = 'left',
+                page_break_before: bool = False):
     """添加标题段落
 
     使用 Word 原生 Heading 1/2/3 样式（支持大纲/目录/导航）
     宋体加粗，按层级设置字号（16/15/14/12pt）
     alignment: 'left' / 'center' / 'right'（按 PDF 实际位置推断）
+    page_break_before: 是否在标题前另起一页（一级标题用）
     """
     # 使用 Word 原生 Heading 样式，让 Word 知道这是标题
     # 这样 Word 的大纲视图、目录生成、导航窗格都能识别
@@ -330,6 +340,10 @@ def add_heading(doc: Document, text: str, level: int, alignment: str = 'left'):
     except KeyError:
         # 退化：手动建样式
         p = doc.add_paragraph()
+
+    # 一级标题另起一页
+    if page_break_before:
+        p.paragraph_format.page_break_before = True
 
     # 清空原有的样式字体（python-docx 默认 Heading 样式可能是 Calibri）
     p.style.font.name = HEADING_FONT['en']
@@ -598,20 +612,26 @@ def generate_word(elements: List[ContentElement], output_path: str):
     import logging
     _log = logging.getLogger(__name__)
     added_counts = {'heading': 0, 'text': 0, 'table': 0, 'image': 0, 'skipped_empty': 0, 'skipped_header': 0}
+    content_added = False  # 记录是否已有内容，决定一级标题是否另起一页
     for elem in elements:
         if elem.type == 'heading':
             # 更新章节号
             counter.update_chapter(elem.text, elem.heading_level or 1)
             # 添加标题（传 alignment 保持 PDF 原版位置）
             if elem.text and elem.text.strip():
+                # 一级标题另起一页：已有正文才分页，避免文档开头空白页
+                page_break = (elem.heading_level == 1) and content_added
                 add_heading(doc, elem.text, elem.heading_level or 1,
-                            alignment=elem.alignment or 'left')
+                            alignment=elem.alignment or 'left',
+                            page_break_before=page_break)
+                content_added = True
                 added_counts['heading'] += 1
 
         elif elem.type == 'table':
             # 添加表格
             if elem.html:
                 add_table(doc, elem.html, counter)
+                content_added = True
                 added_counts['table'] += 1
             else:
                 _log.warning(f"[DIAG-gen] 表格被跳过：无 html, text={elem.text[:50]!r}")
@@ -620,6 +640,7 @@ def generate_word(elements: List[ContentElement], output_path: str):
             # 添加图片
             if elem.image_data:
                 add_image(doc, elem.image_data, counter)
+                content_added = True
                 added_counts['image'] += 1
             else:
                 _log.warning(f"[DIAG-gen] 图片被跳过：无 image_data, text={elem.text[:50]!r}")
@@ -642,6 +663,7 @@ def generate_word(elements: List[ContentElement], output_path: str):
                 alignment=elem.alignment or 'left',
                 bold=bool(elem.is_bold),
             )
+            content_added = True
             added_counts['text'] += 1
 
     _log.info(f"[DIAG-gen] 生成统计: {added_counts}")
