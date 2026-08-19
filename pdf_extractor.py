@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ContentElement:
     """PDF内容元素的统一表示"""
-    type: str  # 'text', 'heading', 'title', 'table', 'image', 'figure'
+    type: str  # 'text', 'heading', 'title', 'table', 'image', 'figure', 'toc'
     text: str = ''
     bbox: List[float] = field(default_factory=list)  # [x1, y1, x2, y2] in PDF points
     page_num: int = 0
@@ -35,6 +35,7 @@ class ContentElement:
     font_size: Optional[float] = None
     is_bold: Optional[bool] = None
     is_italic: Optional[bool] = None
+    color: Optional[int] = None  # sRGB整数，如0x000000黑
 
     # 表格专用
     html: Optional[str] = None
@@ -46,6 +47,19 @@ class ContentElement:
     heading_level: Optional[int] = None
     mapped_size: Optional[float] = None
     alignment: Optional[str] = None
+
+    # ---- 数字版PDF专用（extract_digital_pdf）----
+    # 行内run列表：保留段落内不同字体/字号/颜色/加粗的片段（如"CAB-A"、超链接）
+    # 每项: {'text': str, 'size': float, 'bold': bool, 'italic': bool, 'color': int}
+    runs: Optional[List[Dict]] = None
+    # 目录条目：标题 + 右对齐页码（制表位+引导符重建）
+    is_toc: bool = False
+    toc_title: str = ''
+    toc_page_no: str = ''
+    # 相对正文左边界的左缩进（pt），目录层级/列表缩进用
+    left_indent_pt: float = 0.0
+    # 该元素所在页是否为横版（宽>高），Word生成时切换分节方向
+    is_landscape: bool = False
 
 
 # ============================================================
@@ -542,14 +556,18 @@ def _match_pymupdf_table(bbox, tables: List[Dict]) -> Optional[Dict]:
 
 
 def _rows_to_html(rows: List[list]) -> str:
-    """把 PyMuPDF 表格行数据转成简单 HTML 表格"""
+    """把表格行数据转成简单 HTML 表格
+
+    单元格内换行保留（生成Word时渲染为软换行，保持单元格内部结构）。
+    """
     html_rows = []
     for row in rows:
         cells = []
         for cell in row:
             if cell is None:
                 cell = ''
-            cell_text = str(cell).strip().replace('\n', ' ')
+            # 压缩换行周围的空白，保留行结构
+            cell_text = re.sub(r'[ \t]*\n[ \t]*', '\n', str(cell).strip())
             # 避免把 HTML 标签当文本
             cell_text = cell_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             cells.append(f'<td>{cell_text}</td>')
@@ -1081,6 +1099,667 @@ def _extract_block_alignment(block: Dict) -> Optional[str]:
             elif val == 0:
                 return 'left'
     return None
+
+
+# ============================================================
+# 数字版PDF专用提取路径（纯PyMuPDF，不经OCR）
+#
+# 适用：内容流含真实文本的PDF（Word/WPS导出等）。
+# 核心思路：
+# 1. 按 baseline（文字基线）把所有 span 聚成"视觉行"——解决
+#    中英混排/异字号被拆成多段的问题（如"2026年7月"拆成"20267"+"年 月"）
+# 2. 行内按 x 排序拼接，按间隙插入空格——保证"CAB-A"、网址等行内片段不脱离正文
+# 3. 按"上一行是否排满 + 当前行起点 + 行距 + 样式"把视觉行合并成逻辑段落
+# 4. 识别目录行（标题+点线引导符+页码），用制表位重建
+# 5. PyMuPDF find_tables 检测表格，表格内文字不进入正文流
+# ============================================================
+
+# CJK字符判定（汉字/中文标点/全角符号）
+_CJK_CHAR_RE = re.compile(
+    '[\u2e80-\u2eff\u3000-\u303f\u31c0-\u31ef\u3200-\u32ff'
+    '\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\ufe30-\ufe4f\uff00-\uffef]')
+_LATIN_WORD_RE = re.compile('[A-Za-z0-9]')
+
+# 目录引导符
+_TOC_DOT_CHARS = '.\uff0e\u00b7\u2022\u2026\u22ef'
+
+
+def _is_cjk_char(ch: str) -> bool:
+    return bool(_CJK_CHAR_RE.match(ch)) if ch else False
+
+
+# 配对括号/引号（用于判断跨行换行）
+_PAIR_OPEN = '（【「『《〈“‘([{'
+_PAIR_CLOSE = '）】」』》〉”’)]}'
+
+
+def _has_unclosed_pair(text: str) -> bool:
+    """文本中是否存在未闭合的开括号/引号（行尾跨行的强信号）"""
+    depth = 0
+    for ch in text:
+        if ch in _PAIR_OPEN:
+            depth += 1
+        elif ch in _PAIR_CLOSE and depth > 0:
+            depth -= 1
+    return depth > 0
+
+
+def _dp_collect_spans(page) -> List[Dict]:
+    """收集一页内所有水平文本span（含baseline、颜色等完整信息）
+
+    使用rawdict取字符级信息：PDF里的窄空格（宽度<0.35em）多为
+    Word/WPS"自动调整中英文间距"导出的产物，予以去除（生成Word时
+    Word会按自身设置重新渲染自动间距）；真实输入的空格（较宽）保留。
+    """
+    spans = []
+    raw = page.get_text("rawdict")
+    for block in raw.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            # 跳过旋转/竖排文本
+            d = line.get("dir") or (1, 0)
+            if abs(d[0]) < 0.98 or abs(d[1]) > 0.2:
+                continue
+            for span in line.get("spans", []):
+                chars = span.get("chars", [])
+                if not chars:
+                    continue
+                text, bbox, origin = _dp_clean_span_chars(
+                    chars, float(span.get("size", 0)),
+                    tuple(span.get("origin", (0, 0))))
+                if not text.strip():
+                    continue
+                flags = span.get("flags", 0)
+                font_name = span.get("font", "")
+                spans.append({
+                    'text': text,
+                    'bbox': bbox,
+                    'origin': origin,
+                    'font': font_name,
+                    'size': float(span.get("size", 0)),
+                    'flags': flags,
+                    'color': int(span.get("color", 0)),
+                    'is_bold': bool(flags & 16) or _is_bold_font_name(font_name),
+                    'is_italic': bool(flags & 2) or 'italic' in font_name.lower(),
+                    'is_superscript': bool(flags & 1),
+                })
+    return spans
+
+
+def _dp_clean_span_chars(chars: List[Dict], size: float, origin: Tuple[float, float]):
+    """字符级清洗span：去自动间距伪空格、补偿字距过大的西文单词空格
+
+    返回 (text, bbox, origin)：
+    - 窄空格（<0.35em）且相邻CJK：去除（Word自动间距产物）
+    - 字符间隙过大（>0.5em）且两侧均为西文字母数字：补空格
+    - bbox/origin按保留字符重算
+    """
+    kept: List[Dict] = []
+    n = len(chars)
+    for i, c in enumerate(chars):
+        ch = c.get("c", "")
+        if ch in (" ", "\t"):
+            w = c["bbox"][2] - c["bbox"][0]
+            if size > 0 and w < 0.35 * size:
+                # 前一个非空字符 / 后一个非空字符
+                prev_ch = kept[-1]["c"] if kept else ""
+                next_ch = ""
+                for j in range(i + 1, n):
+                    if chars[j].get("c", "") not in (" ", "\t"):
+                        next_ch = chars[j]["c"]
+                        break
+                if _is_cjk_char(prev_ch) or _is_cjk_char(next_ch):
+                    continue  # 丢弃伪空格
+        kept.append(c)
+    if not kept:
+        return "", [0, 0, 0, 0], origin
+    # 西文单词间隙补偿（内容流未写空格、仅用字距分隔的情形）
+    pieces: List[str] = []
+    prev_c = None
+    for c in kept:
+        if prev_c is not None:
+            gap = c["bbox"][0] - prev_c["bbox"][2]
+            if (size > 0 and gap > 0.5 * size
+                    and _LATIN_WORD_RE.match(prev_c["c"] or "")
+                    and _LATIN_WORD_RE.match(c["c"] or "")):
+                pieces.append(" ")
+        pieces.append(c["c"])
+        prev_c = c
+    x0 = min(c["bbox"][0] for c in kept)
+    x1 = max(c["bbox"][2] for c in kept)
+    y0 = min(c["bbox"][1] for c in kept)
+    y1 = max(c["bbox"][3] for c in kept)
+    o = (kept[0]["origin"][0], origin[1]) if kept[0].get("origin") else origin
+    return "".join(pieces), [x0, y0, x1, y1], o
+
+
+def _dp_group_rows(spans: List[Dict]) -> List[Dict]:
+    """按baseline把span聚成视觉行（同行合并，核心防碎片化步骤）
+
+    同一基线的不同字体/字号span（如 Times数字 + 宋体汉字）合并为一行。
+    容差 max(2pt, 0.35*字号)：覆盖生成器基线误差，又远小于行距。
+    """
+    if not spans:
+        return []
+    rows: List[Dict] = []
+
+    def _row_tol(row, span):
+        return max(2.0, 0.35 * max(row['size'], span['size']))
+
+    for span in sorted(spans, key=lambda s: (s['origin'][1], s['bbox'][0])):
+        placed = False
+        for row in rows:
+            if abs(span['origin'][1] - row['baseline']) <= _row_tol(row, span):
+                row['spans'].append(span)
+                # 行的主字号取"字符数最多"的span，行内异体字号保留在run里
+                if len(span['text']) > row.get('_dom_len', 0):
+                    row['size'] = span['size']
+                    row['_dom_len'] = len(span['text'])
+                placed = True
+                break
+        if not placed:
+            rows.append({
+                'baseline': span['origin'][1],
+                'spans': [span],
+                'size': span['size'],
+                '_dom_len': len(span['text']),
+            })
+
+    # 后处理：把"孤立小片段行"（上标/下标等）并回相邻主行
+    rows = _dp_merge_orphan_fragments(rows)
+
+    # 行内排序并计算行bbox/文本/runs
+    result = []
+    for row in rows:
+        row['spans'].sort(key=lambda s: s['bbox'][0])
+        xs0 = min(s['bbox'][0] for s in row['spans'])
+        xs1 = max(s['bbox'][2] for s in row['spans'])
+        ys0 = min(s['bbox'][1] for s in row['spans'])
+        ys1 = max(s['bbox'][3] for s in row['spans'])
+        row['x0'], row['x1'] = xs0, xs1
+        row['y0'], row['y1'] = ys0, ys1
+        row['text'], row['runs'] = _dp_build_row_text(row['spans'])
+        if not row['text']:
+            continue
+        # 行级样式聚合（run级样式已保留，这里给段落判断用）
+        chars = {}
+        for s in row['spans']:
+            k = (s['font'], s['is_bold'], s['is_italic'], s['color'])
+            chars[k] = chars.get(k, 0) + len(s['text'].strip())
+        dom = max(chars, key=chars.get)
+        row['font'], row['bold'], row['italic'], row['color'] = dom
+        result.append(row)
+    result.sort(key=lambda r: (r['baseline'], r['x0']))
+    return result
+
+
+def _dp_merge_orphan_fragments(rows: List[Dict]) -> List[Dict]:
+    """把疑似上标/下标的孤立短行并回主行
+
+    特征：片段极短、基线与主行偏差在 (容差, 0.9*字号] 之间、水平范围有重叠。
+    """
+    if len(rows) < 2:
+        return rows
+    merged_flags = [False] * len(rows)
+    out = []
+    for i, row in enumerate(rows):
+        if merged_flags[i]:
+            continue
+        frag_text = ''.join(s['text'] for s in row['spans']).strip()
+        # 主行自身处理
+        # 尝试把相邻行(前后)的孤立短片段吸收进来
+        for j in range(len(rows)):
+            if j == i or merged_flags[j]:
+                continue
+            other = rows[j]
+            other_text = ''.join(s['text'] for s in other['spans']).strip()
+            if len(other_text) > 6:
+                continue
+            if _dp_rows_x_overlap(row, other) <= 0:
+                continue
+            bl_diff = other['baseline'] - row['baseline']
+            max_off = 0.9 * max(row['size'], other['size'])
+            if 2.0 < abs(bl_diff) <= max_off:
+                row['spans'].extend(other['spans'])
+                merged_flags[j] = True
+        out.append(row)
+    return out
+
+
+def _dp_rows_x_overlap(a: Dict, b: Dict) -> float:
+    """两行水平投影重叠长度"""
+    ax0, ax1 = min(s['bbox'][0] for s in a['spans']), max(s['bbox'][2] for s in a['spans'])
+    bx0, bx1 = min(s['bbox'][0] for s in b['spans']), max(s['bbox'][2] for s in b['spans'])
+    return min(ax1, bx1) - max(ax0, bx0)
+
+
+def _dp_build_row_text(spans: List[Dict]):
+    """行内span按x排序拼接成文本 + run列表（保留行内异体样式）
+
+    - 间隙超过阈值且边界非CJK-CJK时插入空格
+    - 相邻同样式span合并为一个run
+    """
+    runs = []
+    texts = []
+    prev = None
+    for s in spans:
+        piece = s['text']
+        if prev is not None:
+            gap = s['bbox'][0] - prev['bbox'][2]
+            need_space = False
+            if gap > max(1.2, 0.5 * prev['size']):
+                a, b = prev['text'][-1], piece[:1]
+                # CJK-CJK边界不插空格（两端对齐的字间距不是真空格）
+                if not (_is_cjk_char(a) and _is_cjk_char(b)):
+                    need_space = True
+            if need_space and not prev['text'].endswith(' ') and not piece.startswith(' '):
+                texts.append(' ')
+                if runs:
+                    runs[-1]['text'] += ' '
+        texts.append(piece)
+        style_key = (round(s['size'], 1), s['is_bold'], s['is_italic'], s['color'])
+        if runs and runs[-1]['key'] == style_key:
+            runs[-1]['text'] += piece
+        else:
+            runs.append({
+                'key': style_key,
+                'text': piece,
+                'size': s['size'],
+                'bold': s['is_bold'],
+                'italic': s['is_italic'],
+                'color': s['color'],
+            })
+        prev = s
+    text = ''.join(texts).strip()
+    # 去掉首尾run的空白
+    while runs and not runs[0]['text'].strip():
+        runs.pop(0)
+    while runs and not runs[-1]['text'].strip():
+        runs.pop()
+    if runs:
+        runs[0]['text'] = runs[0]['text'].lstrip()
+        runs[-1]['text'] = runs[-1]['text'].rstrip()
+    clean_runs = [r for r in runs if r['text']]
+    return text, clean_runs
+
+
+def _dp_join_lines(a_text: str, b_text: str) -> str:
+    """段落内两行拼接：仅在西文单词边界补空格，其余直接拼接"""
+    if not a_text:
+        return b_text
+    if not b_text:
+        return a_text
+    ca, cb = a_text[-1], b_text[0]
+    if _LATIN_WORD_RE.match(ca) and _LATIN_WORD_RE.match(cb):
+        return a_text + ' ' + b_text
+    return a_text + b_text
+
+
+def _dp_match_toc(text: str):
+    """识别目录条目：标题 + 引导点线 + 页码
+
+    返回 (title, page_no) 或 None
+    """
+    if not text or len(text) > 200:
+        return None
+    # 点线之间的空白去掉（"… … …"归一为"………"）
+    t = re.sub(r'(?<=[' + re.escape(_TOC_DOT_CHARS) + r'])\s+'
+               r'(?=[' + re.escape(_TOC_DOT_CHARS) + r'])', '', text)
+    m = re.search(r'(?:[\.\uff0e\u00b7\u2022]{3,}|[\u2026\u22ef]{2,})\s*(\d{1,4})\s*$', t)
+    if not m:
+        return None
+    title = t[:m.start()].rstrip(' ' + _TOC_DOT_CHARS).strip()
+    if not title or len(title) > 60:
+        return None
+    return title, m.group(1)
+
+
+def _dp_is_page_numberish(text: str) -> bool:
+    t = text.strip()
+    if re.fullmatch(r'-?\s*[\dIVXLCDMivxlcdm]+\s*-?', t):
+        return True
+    if re.fullmatch(r'第\s*[\d零一二三四五六七八九十百千]+\s*页(\s*共\s*[\d零一二三四五六七八九十百千]+\s*页)?', t):
+        return True
+    if re.fullmatch(r'[\d]+\s*/\s*[\d]+', t):
+        return True
+    if re.fullmatch(r'[IVXLC]+', t):
+        return True
+    return False
+
+
+def _dp_extract_tables(page, page_num: int, is_landscape: bool,
+                       spans: List[Dict]) -> Tuple[List[Dict], List[List[float]]]:
+    """检测页面表格：返回 (table元素列表, 有效表格bbox列表)
+
+    表格bbox用于把表格内文字从正文流中排除。
+    单元格文本用页面已清洗span按基线重建（find_tables的extract()
+    按字距阈值补空格，两端对齐单元格会产生"名 称"这类伪空格）。
+    """
+    table_elems = []
+    valid_bboxes = []
+    try:
+        finder = page.find_tables()
+    except Exception:
+        return [], []
+    for t in finder.tables:
+        rows = _dp_table_rows_from_spans(t, spans)
+        if not rows:
+            continue
+        non_empty = sum(1 for r in rows for c in r if c and str(c).strip())
+        if t.row_count < 2 or t.col_count < 2 or non_empty < 4:
+            continue
+        bb = list(t.bbox)
+        if len(bb) != 4:
+            continue
+        table_elems.append(ContentElement(
+            type='table', text='', bbox=bb, page_num=page_num,
+            html=_rows_to_html(rows), is_landscape=is_landscape,
+        ))
+        valid_bboxes.append(bb)
+    return table_elems, valid_bboxes
+
+
+def _dp_table_rows_from_spans(t, spans: List[Dict]) -> List[List[str]]:
+    """用页面已清洗span重建表格单元格文本
+
+    - 按单元格bbox圈选中心点落入的span
+    - 以基线重组视觉行（"名"+"称：..."这类被内容流拆开的同行片段
+      会正确合并，且CJK边界不补空格）
+    - 单元格内多行用'\\n'保留（python-docx渲染为软换行）
+    - 合并格（bbox为None）输出''
+    """
+    rows_out: List[List[str]] = []
+    for row in t.rows:
+        cells_out: List[str] = []
+        for cb in row.cells:
+            if cb is None:
+                cells_out.append('')
+                continue
+            x0, y0, x1, y1 = cb
+            sel = [s for s in spans
+                   if x0 <= (s['bbox'][0] + s['bbox'][2]) / 2 <= x1
+                   and y0 <= (s['bbox'][1] + s['bbox'][3]) / 2 <= y1]
+            if sel:
+                lines = [r['text'] for r in _dp_group_rows(sel) if r['text']]
+                cells_out.append('\n'.join(lines))
+            else:
+                cells_out.append('')
+        rows_out.append(cells_out)
+    return rows_out
+
+
+def _dp_span_in_tables(span: Dict, table_bboxes: List[List[float]]) -> bool:
+    """span中心是否落在某个表格bbox内"""
+    cx = (span['bbox'][0] + span['bbox'][2]) / 2
+    cy = (span['bbox'][1] + span['bbox'][3]) / 2
+    for bb in table_bboxes:
+        if bb[0] <= cx <= bb[2] and bb[1] <= cy <= bb[3]:
+            return True
+    return False
+
+
+def _dp_detect_alignment(rows: List[Dict], content_left: float, content_right: float,
+                         page_width: float) -> str:
+    """段落对齐检测（基于几何）
+
+    - center：探针行（末行优先）左右留白均衡 + 全部行的中心点互相靠近
+      （正文两端对齐行左右留白也对称，但末行必始于左边界，用lm阈值排除：
+      首行缩进恰为2字符=2*字号，真实居中行的留白>=2.5*字号）
+    - right：末行右缘贴齐内容右边界且首行明显缩进
+    - 其余 left
+    """
+    if not rows:
+        return 'left'
+    full_tol = 0.04 * page_width
+    right_edge = content_right - full_tol
+    partial = [r for r in rows if r['x1'] < right_edge]
+    # 探针行：末行（最能反映对齐方式），末行排满则取最窄的不满行
+    if rows[-1]['x1'] < right_edge:
+        probe = rows[-1]
+    elif partial:
+        probe = min(partial, key=lambda r: r['x1'] - r['x0'])
+    else:
+        probe = min(rows, key=lambda r: r['x1'] - r['x0'])
+    lm = probe['x0'] - content_left
+    rm = content_right - probe['x1']
+    # 居中段落各行中心点互相靠近（正文末行偏左、右对齐各行中心发散）
+    centers = [(r['x0'] + r['x1']) / 2 for r in rows]
+    centers_aligned = max(centers) - min(centers) < 0.03 * page_width
+    if (centers_aligned
+            and abs(lm - rm) < 0.025 * page_width
+            and lm > 2.5 * max(probe['size'], 1)):
+        return 'center'
+    # 右对齐：末行贴右边界 + 首行左缘离内容左边界较远
+    last = rows[-1]
+    first = rows[0]
+    if (last['x1'] >= right_edge
+            and first['x0'] - content_left > 0.08 * page_width):
+        return 'right'
+    return 'left'
+
+
+def _dp_rows_to_elements(rows: List[Dict], page_num: int, page_width: float,
+                         is_landscape: bool) -> List[ContentElement]:
+    """把一页的视觉行组装成段落级ContentElement"""
+    if not rows:
+        return []
+    content_left = min(r['x0'] for r in rows)
+    content_right = max(r['x1'] for r in rows)
+    content_width = content_right - content_left
+    body_size = _dp_dominant_size(rows)
+
+    elements: List[ContentElement] = []
+    para_rows: List[Dict] = []  # 当前段落
+
+    def _flush():
+        nonlocal para_rows
+        if not para_rows:
+            return
+        rows_ = para_rows
+        para_rows = []
+        text = ''
+        runs = []
+        for i, r in enumerate(rows_):
+            if i == 0:
+                text = r['text']
+                runs = [dict(x) for x in r['runs']]
+            else:
+                text = _dp_join_lines(text, r['text'])
+                if runs and rows_[i - 1]['runs']:
+                    # 行边界拼接规则（西文补空格）
+                    a = rows_[i - 1]['runs'][-1]['text']
+                    b = r['runs'][0]['text'] if r['runs'] else ''
+                    if a and b and _LATIN_WORD_RE.match(a[-1]) and _LATIN_WORD_RE.match(b[0]):
+                        runs[-1]['text'] += ' '
+                        # b的开头不需要加空格（拼接进下一run）
+                for x in r['runs']:
+                    runs.append(dict(x))
+        bbox = [min(r['x0'] for r in rows_), min(r['y0'] for r in rows_),
+                max(r['x1'] for r in rows_), max(r['y1'] for r in rows_)]
+        # 段落样式：以字符数最多的行为准
+        dom_row = max(rows_, key=lambda r: len(r['text']))
+        alignment = _dp_detect_alignment(rows_, content_left, content_right, page_width)
+        # 目录条目
+        toc = _dp_match_toc(rows_[0]['text']) if len(rows_) == 1 else None
+        if toc:
+            elements.append(ContentElement(
+                type='toc', text=rows_[0]['text'], bbox=bbox, page_num=page_num,
+                font_name=dom_row['font'], font_size=dom_row['size'],
+                is_bold=dom_row['bold'], is_italic=dom_row['italic'],
+                color=dom_row['color'], alignment='left',
+                runs=[dict(x) for x in rows_[0]['runs']],
+                is_toc=True, toc_title=toc[0], toc_page_no=toc[1],
+                left_indent_pt=max(0.0, rows_[0]['x0'] - content_left),
+                is_landscape=is_landscape,
+            ))
+            return
+        elements.append(ContentElement(
+            type='text', text=text, bbox=bbox, page_num=page_num,
+            font_name=dom_row['font'], font_size=dom_row['size'],
+            is_bold=dom_row['bold'], is_italic=dom_row['italic'],
+            color=dom_row['color'], alignment=alignment,
+            runs=runs,
+            left_indent_pt=max(0.0, rows_[0]['x0'] - content_left),
+            is_landscape=is_landscape,
+        ))
+
+    for row in rows:
+        toc = _dp_match_toc(row['text'])
+        if toc:
+            _flush()
+            para_rows = [row]
+            _flush()
+            continue
+
+        if para_rows:
+            prev = para_rows[-1]
+            gap = row['baseline'] - prev['baseline']
+            line_ok = gap <= 2.3 * max(prev['size'], row['size'], body_size)
+            style_ok = (abs(row['size'] - prev['size']) <= 1.2
+                        and row['bold'] == prev['bold'])
+            # 上一行是否"排满"（右缘接近内容右边界）
+            prev_full = prev['x1'] >= content_right - 0.04 * page_width
+            # 当前行起点：回到正文左边界 = 续行；缩进1.2~3.5字符 = 首行/悬挂
+            start_offset = row['x0'] - content_left
+            cont_flush = start_offset <= 0.8 * max(row['size'], 1)
+            cont_hanging = (1.2 * row['size'] < start_offset <= 3.5 * row['size']
+                            and not prev['text'].endswith(('。', '！', '？', '；')))
+            # 居中续行（封面大标题等跨行居中文本）：前行排满、未以闭合标点收尾、
+            # 前行有未闭合的开括号/引号（换行强信号）或当前行很短且居中
+            row_is_center = _dp_detect_alignment(
+                [row], content_left, content_right, page_width) == 'center'
+            cont_center = False
+            if (prev_full and row_is_center
+                    and not prev['text'].endswith(
+                        ('。', '！', '？', '；', '：', '）', '】', '」', '\u201d'))):
+                row_center = (row['x0'] + row['x1']) / 2
+                prev_center = (prev['x0'] + prev['x1']) / 2
+                centers_ok = abs(row_center - prev_center) < 0.05 * page_width
+                prev_open = _has_unclosed_pair(prev['text'])
+                short_row = (row['x1'] - row['x0']) < 0.25 * (content_right - content_left)
+                if (start_offset > 0.8 * max(row['size'], 1)
+                        and centers_ok and (prev_open or short_row)):
+                    cont_center = True
+            # 普通续行不能是居中行（避免把居中段落误并入左对齐正文）
+            merge_ok = False
+            if line_ok and style_ok and prev_full:
+                if cont_center:
+                    merge_ok = True
+                elif (cont_flush or cont_hanging) and not row_is_center:
+                    merge_ok = True
+            if merge_ok:
+                para_rows.append(row)
+                continue
+        _flush()
+        para_rows = [row]
+    _flush()
+    return elements
+
+
+def _dp_dominant_size(rows: List[Dict]) -> float:
+    """一页的主字号（按字符数加权）"""
+    counter: Dict[float, int] = {}
+    for r in rows:
+        counter[r['size']] = counter.get(r['size'], 0) + len(r['text'])
+    if not counter:
+        return 10.5
+    return max(counter, key=counter.get)
+
+
+def is_digital_pdf(pdf_path: str, sample_pages: int = 10, min_chars: int = 30) -> bool:
+    """判断是否为数字版PDF（有真实文本层），是则走纯PyMuPDF路径"""
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return False
+    try:
+        n = len(doc)
+        if n == 0:
+            return False
+        step = max(1, n // sample_pages)
+        idxs = list(range(0, n, step))[:sample_pages]
+        with_text = 0
+        for i in idxs:
+            try:
+                if len(doc.load_page(i).get_text("text").strip()) >= min_chars:
+                    with_text += 1
+            except Exception:
+                pass
+        return with_text >= max(1, int(len(idxs) * 0.6))
+    except Exception:
+        return False
+    finally:
+        doc.close()
+
+
+def extract_digital_pdf(pdf_path: str) -> List[ContentElement]:
+    """数字版PDF主提取入口（纯PyMuPDF，速度快且无OCR误差）"""
+    doc = fitz.open(pdf_path)
+    elements: List[ContentElement] = []
+    total_pages = len(doc)
+    from config import MAX_PAGES
+    if MAX_PAGES and MAX_PAGES > 0 and total_pages > MAX_PAGES:
+        total_pages = MAX_PAGES
+
+    # 第一遍：逐页收集行/表格（先不过滤页眉页脚，便于统计重复）
+    page_rows: List[List[Dict]] = []
+    page_tables: List[List[ContentElement]] = []
+    page_meta = []
+    for pno in range(total_pages):
+        page = doc.load_page(pno)
+        is_landscape = page.rect.width > page.rect.height
+        spans = _dp_collect_spans(page)
+        table_elems, table_bboxes = _dp_extract_tables(page, pno, is_landscape, spans)
+        spans = [s for s in spans
+                 if not _dp_span_in_tables(s, table_bboxes)]
+        rows = _dp_group_rows(spans)
+        page_rows.append(rows)
+        page_tables.append(table_elems)
+        page_meta.append({'width': page.rect.width, 'height': page.rect.height,
+                          'landscape': is_landscape})
+    doc.close()
+
+    # 页眉页脚：跨页重复的条带内短文本 + 页码样式
+    band_text_count: Dict[str, int] = {}
+    for pno, rows in enumerate(page_rows):
+        h = page_meta[pno]['height']
+        for r in rows:
+            if r['y0'] < 50 or r['y1'] > h - 55:
+                key = r['text'].strip()
+                if len(key) > 6:
+                    band_text_count[key] = band_text_count.get(key, 0) + 1
+    repeat_threshold = max(3, int(total_pages * 0.3))
+
+    def _is_header_footer(pno: int, row: Dict) -> bool:
+        h = page_meta[pno]['height']
+        in_band = row['y0'] < 50 or row['y1'] > h - 55
+        t = row['text'].strip()
+        if not in_band:
+            # 页码可能落在较宽的底部条带外沿（如罗马页码"I/II"），
+            # 纯页码样式的短文本直接剔除
+            if row['y1'] > h - 95 and len(t) <= 8 and _dp_is_page_numberish(t):
+                return True
+            return False
+        if _dp_is_page_numberish(t):
+            return True
+        if len(t) <= 8:
+            return True
+        if band_text_count.get(t, 0) >= repeat_threshold:
+            return True
+        return False
+
+    # 第二遍：过滤页眉页脚并组装段落
+    for pno, rows in enumerate(page_rows):
+        meta = page_meta[pno]
+        kept = [r for r in rows if not _is_header_footer(pno, r)]
+        elements.extend(_dp_rows_to_elements(kept, pno, meta['width'], meta['landscape']))
+        elements.extend(page_tables[pno])
+
+    elements.sort(key=lambda e: (e.page_num,
+                                  e.bbox[1] if e.bbox else 0,
+                                  e.bbox[0] if e.bbox else 0))
+    return elements
 
 
 # ============================================================

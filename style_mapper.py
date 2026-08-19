@@ -43,59 +43,79 @@ def detect_body_font_size(elements: List[ContentElement]) -> float:
 # ============================================================
 # 标题层级推断
 # ============================================================
+# 模板字号 -> 标题层级
+_TEMPLATE_SIZE_TO_LEVEL = {16: 1, 15: 2, 14: 3, 12: 4}
+
+# 句末标点（完整句子的标志，标题一般不带）
+_SENTENCE_END_CHARS = ('。', '！', '？', '；')
+
+
 def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]:
     """推断标题层级（1-4），非标题返回None
 
     信号优先级（从强到弱）：
-    1. 文本模式匹配（中文标题编号正则）—— 最可靠
-    2. 元素 type 已经是 'heading'（来自 PP-StructureV3 版面分析）
-    3. 字号判断（>=16pt 必为标题）
-    4. 加粗+字号大于正文
+    1. 字号显著大于正文 -> 按模板字号映射层级（16/15/14/12 -> 1/2/3/4）
+       数字版PDF提取的字号精确可靠，是最强信号
+    2. 文本模式匹配（"第X章"等强模式直接采信；
+       "N." / "N.M" 弱模式需加粗或字号大于正文佐证，避免把
+       "3.2 本次招标不接受联合体投标。"这类正文句子误判为标题）
+    3. 加粗且字号略大于正文 -> 四级标题
+
+    目录条目（is_toc）一律不是标题。
     """
-    text = elem.text.strip()
+    text = (elem.text or '').strip()
     if not text:
         return None
-
+    if getattr(elem, 'is_toc', False):
+        return None
     # 标题通常不会超过 100 字符
     if len(text) > 100:
         return None
 
-    font_size = elem.font_size
-    is_bold = elem.is_bold
-    is_layout_heading = elem.type == 'heading'
+    font_size = elem.font_size or 0
+    is_bold = bool(elem.is_bold)
+    ends_sentence = text.endswith(_SENTENCE_END_CHARS)
 
-    # ---- 信号1：文本模式匹配（最可靠，尤其一级"第X章"）----
+    # ---- 信号1：字号显著大于正文 -> 模板字号映射 ----
+    if font_size > 0 and body_size > 0 and font_size >= body_size + 1.5:
+        mapped = map_font_size(font_size)
+        level = _TEMPLATE_SIZE_TO_LEVEL.get(mapped)
+        if level == 4:
+            # 12pt仅比正文大1.5pt左右，字号证据弱：交由信号2/3
+            # （模式匹配/加粗）裁决，避免"电话：020-xxx"等
+            # 个别放大的正文行被误判为四级标题
+            pass
+        elif level:
+            # 大字号但完整长句（如通知正文的强调段）不当标题
+            if ends_sentence and len(text) > 30:
+                return None
+            return level
+        elif font_size >= body_size * 1.5:
+            return 1
+        else:
+            return 3
+
+    # ---- 信号2：文本模式匹配 ----
     pattern_level = _match_heading_pattern(text)
     if pattern_level:
-        return pattern_level
-
-    # ---- 以下无文本模式，用字号保守判断 ----
-    # 关键：版面"heading"不再默认标为一级，避免普通小节标题被误判为
-    # 一级标题而另起一页。是否一级只看字号是否显著大于正文。
-    if not font_size or font_size <= 0:
-        # 无字号信息（扫描件或缺span）：仅当版面明确判为标题时给中等层级，
-        # 避免漏掉真实标题，但也绝不默认成一级
-        return 3 if is_layout_heading else None
-
-    if body_size and body_size > 0 and font_size <= body_size + 0.5:
-        # 字号与正文相当 → 大概率是加粗正文/列表大项，不是标题
+        if pattern_level in (1, 2):
+            # 强模式："第X章"/"一、"等，短且非完整句即可
+            if len(text) <= 40 and not (ends_sentence and len(text) > 20):
+                return pattern_level
+            return None
+        # 弱模式："N. 标题" / "N.M 标题"：需加粗或字号大于正文佐证
+        if ends_sentence:
+            return None
+        if is_bold or (font_size > 0 and body_size > 0 and font_size > body_size + 0.5):
+            if len(text) <= 40:
+                return pattern_level
         return None
 
-    scale = font_size / body_size if body_size and body_size > 0 else 1.0
-    # 一级标题需要非常显著的证据（大字号，或明显大于正文倍数）
-    if is_bold:
-        if font_size >= 18 or scale >= 1.5:
-            return 1
-        if font_size >= 16 or scale >= 1.25:
-            return 2
-        if font_size >= 14 or scale >= 1.1:
-            return 3
-        return None
-    # 非加粗：只有明显大于正文才算标题
-    if scale >= 1.4:
-        return 1
-    if scale >= 1.2:
-        return 2
+    # ---- 信号3：加粗且字号略大于正文 ----
+    if (is_bold and font_size > 0 and body_size > 0
+            and font_size > body_size + 0.5 and len(text) <= 40):
+        return 4
+
     return None
 
 

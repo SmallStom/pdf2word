@@ -11,11 +11,13 @@
 
 import re
 import io
-from typing import List
+from typing import List, Optional
 
 from docx import Document
-from docx.shared import Pt, Cm, Emu
+from docx.shared import Pt, Cm, Emu, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_LINE_SPACING
+from docx.enum.text import WD_TAB_ALIGNMENT, WD_TAB_LEADER
+from docx.enum.section import WD_SECTION, WD_ORIENT
 from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
@@ -274,20 +276,65 @@ def _add_field(paragraph, field_code: str):
 # ============================================================
 # 正文段落
 # ============================================================
+def _add_text_runs(paragraph, runs: List[dict], default_size_pt: float,
+                   bold: bool = False):
+    """向段落写入多个run（保留PDF行内异体样式：字号/加粗/颜色）
+
+    runs 每项: {'text', 'size', 'bold', 'italic', 'color'}
+    文本内的换行符转为 Word 软换行（<w:br/>）。
+    """
+    for rd in runs:
+        text = rd.get('text') or ''
+        if not text:
+            continue
+        size = rd.get('size') or default_size_pt
+        run_bold = bool(rd.get('bold', bold))
+        segments = text.split('\n')
+        run = None
+        for i, seg in enumerate(segments):
+            if i > 0:
+                run.add_break()
+            if seg:
+                run = paragraph.add_run(seg)
+                _set_run_font(run,
+                              cn_font=BODY_FONT['cn'],
+                              en_font=BODY_FONT['en'],
+                              size_pt=size,
+                              bold=run_bold,
+                              italic=bool(rd.get('italic', False)))
+                color = rd.get('color')
+                if color is not None and int(color) != 0:
+                    c = int(color)
+                    run.font.color.rgb = RGBColor(
+                        (c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF)
+        # 段末换行：补一个换行run（极少出现）
+        if text.endswith('\n') and run is not None:
+            run.add_break()
+
+
 def add_body_paragraph(doc: Document, text: str, size_pt: float = None,
-                        alignment: str = 'left', bold: bool = False):
+                       alignment: str = 'left', bold: bool = False,
+                       runs: Optional[List[dict]] = None,
+                       color: Optional[int] = None,
+                       left_indent_pt: float = 0.0):
     """添加正文段落
 
     宋体+Times New Roman，小四号(12pt)或指定字号，1.5倍行距，首行缩进2字符
+    - runs: PDF行内异体样式run列表（保留混排字号/加粗/颜色）
+    - color: 段落主色（runs为空时生效）
+    - left_indent_pt: 左缩进（目录层级等）
     """
     p = doc.add_paragraph()
-    run = p.add_run(text)
     actual_size = size_pt if size_pt and size_pt > 0 else BODY_FONT['size_pt']
-    _set_run_font(run,
-                  cn_font=BODY_FONT['cn'],
-                  en_font=BODY_FONT['en'],
-                  size_pt=actual_size,
-                  bold=bold)
+
+    if runs:
+        _add_text_runs(p, runs, actual_size, bold=bold)
+    else:
+        _add_text_runs(p, [{'text': text, 'size': actual_size,
+                            'bold': bold, 'italic': False,
+                            'color': color}],
+                       actual_size, bold=bold)
+
     _set_paragraph_spacing(p,
                            line_spacing=BODY_FONT['line_spacing'],
                            space_before=BODY_FONT['space_before_pt'],
@@ -297,6 +344,8 @@ def add_body_paragraph(doc: Document, text: str, size_pt: float = None,
     if alignment == 'left' and not _is_toc_entry(text):
         indent_pt = actual_size * BODY_FONT['first_line_indent_chars']
         p.paragraph_format.first_line_indent = Pt(indent_pt)
+    if left_indent_pt > 0:
+        p.paragraph_format.left_indent = Pt(left_indent_pt)
     if alignment == 'center':
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
     elif alignment == 'right':
@@ -315,6 +364,52 @@ def _is_toc_entry(text: str) -> bool:
 
 
 # ============================================================
+# 目录条目段落（标题 + 制表位引导符 + 右对齐页码）
+# ============================================================
+def add_toc_paragraph(doc: Document, title: str, page_no: str,
+                      left_indent_pt: float = 0.0,
+                      size_pt: float = None,
+                      usable_width_cm: float = None):
+    """重建目录条目：标题 + 右对齐制表位（点状引导符）+ 页码
+
+    结构与Word原生目录一致：
+    - 制表位定位在可用宽度右端，前导符为点线
+    - 页码自动右对齐到行尾
+    - 左缩进保留原文层级
+    """
+    p = doc.add_paragraph()
+    actual_size = size_pt if size_pt and size_pt > 0 else BODY_FONT['size_pt']
+    width_cm = usable_width_cm or USABLE_WIDTH_CM
+    # 制表位位置 = 可用宽度 - 左缩进（相对缩进后的文本区）
+    tab_pos_cm = max(1.0, width_cm - left_indent_pt * 0.0352778)
+    p.paragraph_format.tab_stops.add_tab_stop(
+        Cm(tab_pos_cm), WD_TAB_ALIGNMENT.RIGHT, WD_TAB_LEADER.DOTS)
+
+    # 标题run
+    run_title = p.add_run(title)
+    _set_run_font(run_title, cn_font=BODY_FONT['cn'],
+                  en_font=BODY_FONT['en'], size_pt=actual_size)
+    # 制表符run
+    run_tab = p.add_run()
+    run_tab.add_tab()
+    _set_run_font(run_tab, cn_font=BODY_FONT['cn'],
+                  en_font=BODY_FONT['en'], size_pt=actual_size)
+    # 页码run
+    run_page = p.add_run(page_no)
+    _set_run_font(run_page, cn_font=BODY_FONT['cn'],
+                  en_font=BODY_FONT['en'], size_pt=actual_size)
+
+    _set_paragraph_spacing(p,
+                           line_spacing=BODY_FONT['line_spacing'],
+                           space_before=0,
+                           space_after=0,
+                           snap_to_grid=False)
+    if left_indent_pt > 0:
+        p.paragraph_format.left_indent = Pt(left_indent_pt)
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+
+
+# ============================================================
 # 标题段落
 # ============================================================
 def add_heading(doc: Document, text: str, level: int, alignment: str = 'left',
@@ -322,7 +417,7 @@ def add_heading(doc: Document, text: str, level: int, alignment: str = 'left',
     """添加标题段落
 
     使用 Word 原生 Heading 1/2/3 样式（支持大纲/目录/导航）
-    宋体加粗，按层级设置字号（16/15/14/12pt）
+    宋体加粗黑色，按层级设置字号（16/15/14/12pt）
     alignment: 'left' / 'center' / 'right'（按 PDF 实际位置推断）
     page_break_before: 是否在标题前另起一页（一级标题用）
     """
@@ -339,10 +434,12 @@ def add_heading(doc: Document, text: str, level: int, alignment: str = 'left',
     if page_break_before:
         p.paragraph_format.page_break_before = True
 
-    # 清空原有的样式字体（python-docx 默认 Heading 样式可能是 Calibri）
+    # 清空原有的样式字体（python-docx 默认 Heading 样式可能是 Calibri 蓝色）
     p.style.font.name = HEADING_FONT['en']
     p.style.font.size = Pt(HEADING_SIZES.get(level, HEADING_SIZES[4]))
     p.style.font.bold = HEADING_FONT['bold']
+    # 关键：强制标题为黑色（Word内置Heading样式默认是蓝色主题色）
+    p.style.font.color.rgb = RGBColor(0, 0, 0)
     # 同时设置 style 的中文/西文字体
     rPr_style = p.style.element.get_or_add_rPr()
     rFonts_style = rPr_style.find(qn('w:rFonts'))
@@ -356,13 +453,17 @@ def add_heading(doc: Document, text: str, level: int, alignment: str = 'left',
 
     # 添加 run 并设置 run 自己的字体（覆盖 style 的）
     text = _clean_text(text)
-    run = p.add_run(text)
     size = HEADING_SIZES.get(level, HEADING_SIZES[4])
-    _set_run_font(run,
-                  cn_font=HEADING_FONT['cn'],
-                  en_font=HEADING_FONT['en'],
-                  size_pt=size,
-                  bold=HEADING_FONT['bold'])
+    for seg in text.split('\n'):
+        if not seg:
+            continue
+        run = p.add_run(seg)
+        _set_run_font(run,
+                      cn_font=HEADING_FONT['cn'],
+                      en_font=HEADING_FONT['en'],
+                      size_pt=size,
+                      bold=HEADING_FONT['bold'])
+        run.font.color.rgb = RGBColor(0, 0, 0)
     _set_paragraph_spacing(p,
                            line_spacing=BODY_FONT['line_spacing'],
                            space_before=0,
@@ -566,6 +667,33 @@ def add_image(doc: Document, image_data: bytes, counter: FigureTableCounter):
 
 
 # ============================================================
+# 分节方向管理（横版/竖版页面）
+# ============================================================
+def _apply_section_page_setup(section, landscape: bool):
+    """设置分节页面方向与尺寸（A4）"""
+    if landscape:
+        section.orientation = WD_ORIENT.LANDSCAPE
+        section.page_width = Cm(PAGE_SIZE['height_cm'])
+        section.page_height = Cm(PAGE_SIZE['width_cm'])
+    else:
+        section.orientation = WD_ORIENT.PORTRAIT
+        section.page_width = Cm(PAGE_SIZE['width_cm'])
+        section.page_height = Cm(PAGE_SIZE['height_cm'])
+    section.top_margin = Cm(PAGE_MARGINS['top_cm'])
+    section.bottom_margin = Cm(PAGE_MARGINS['bottom_cm'])
+    section.left_margin = Cm(PAGE_MARGINS['left_cm'])
+    section.right_margin = Cm(PAGE_MARGINS['right_cm'])
+    section.header_distance = Cm(HEADER_FOOTER_DISTANCE['header_cm'])
+    section.footer_distance = Cm(HEADER_FOOTER_DISTANCE['footer_cm'])
+
+
+def _usable_width_cm(landscape: bool) -> float:
+    if landscape:
+        return PAGE_SIZE['height_cm'] - PAGE_MARGINS['left_cm'] - PAGE_MARGINS['right_cm']
+    return USABLE_WIDTH_CM
+
+
+# ============================================================
 # 主生成函数
 # ============================================================
 def generate_word(elements: List[ContentElement], output_path: str):
@@ -573,9 +701,11 @@ def generate_word(elements: List[ContentElement], output_path: str):
 
     遍历所有ContentElement，按类型生成对应内容：
     - heading -> 标题段落
+    - toc -> 目录条目（制表位 + 点状引导符 + 右对齐页码）
     - text -> 正文段落
     - table -> 表格（含表名）
     - image -> 图片（含图名）
+    横版页面的元素自动切换到横向分节。
     """
     doc = Document()
 
@@ -605,10 +735,29 @@ def generate_word(elements: List[ContentElement], output_path: str):
     # 4. 遍历内容元素
     import logging
     _log = logging.getLogger(__name__)
-    added_counts = {'heading': 0, 'text': 0, 'table': 0, 'image': 0, 'skipped_empty': 0, 'skipped_header': 0}
+    added_counts = {'heading': 0, 'text': 0, 'toc': 0, 'table': 0, 'image': 0,
+                    'skipped_empty': 0, 'skipped_header': 0}
     content_added = False  # 记录是否已有内容，决定一级标题是否另起一页
+    current_landscape = False  # 当前分节方向（初始为竖版首页）
     for elem in elements:
-        if elem.type == 'heading':
+        # 横版/竖版切换：另起新分节
+        if elem.is_landscape != current_landscape:
+            section = doc.add_section(WD_SECTION.NEW_PAGE)
+            _apply_section_page_setup(section, elem.is_landscape)
+            current_landscape = elem.is_landscape
+
+        if elem.type == 'toc':
+            # 目录条目：标题 + 制表位引导符 + 右对齐页码
+            if elem.toc_title:
+                add_toc_paragraph(
+                    doc, elem.toc_title, elem.toc_page_no,
+                    left_indent_pt=elem.left_indent_pt,
+                    usable_width_cm=_usable_width_cm(current_landscape),
+                )
+                content_added = True
+                added_counts['toc'] += 1
+
+        elif elem.type == 'heading':
             # 更新章节号
             counter.update_chapter(elem.text, elem.heading_level or 1)
             # 添加标题（传 alignment 保持 PDF 原版位置）
@@ -656,6 +805,9 @@ def generate_word(elements: List[ContentElement], output_path: str):
                 size_pt=elem.mapped_size,
                 alignment=elem.alignment or 'left',
                 bold=bool(elem.is_bold),
+                runs=elem.runs,
+                color=elem.color,
+                left_indent_pt=elem.left_indent_pt,
             )
             content_added = True
             added_counts['text'] += 1

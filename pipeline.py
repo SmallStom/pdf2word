@@ -10,6 +10,7 @@ from typing import List
 
 from pdf_extractor import (
     ContentElement, extract_with_layout_analysis,
+    extract_digital_pdf, is_digital_pdf,
 )
 from style_mapper import (
     detect_body_font_size, infer_heading_level,
@@ -24,15 +25,22 @@ class PDFToWordPipeline:
     """PDF转规范Word完整流水线"""
 
     def process(self, pdf_path: str, output_path: str) -> str:
-        import sys
         print(f"[STAGE 0] process() entered, pdf={pdf_path}", flush=True)
         if not os.path.exists(pdf_path):
             print(f"[STAGE 0] PDF file not found!", flush=True)
             raise FileNotFoundError(f"PDF文件不存在: {pdf_path}")
 
-        print(f"[STAGE 1] calling extract_with_layout_analysis", flush=True)
-        logger.info("开始 PP-StructureV3 版面分析...")
-        elements = extract_with_layout_analysis(pdf_path, dpi=200)
+        # 1. 提取：数字版PDF走纯PyMuPDF精确提取（无OCR误差、保字符完整），
+        #    扫描件走 PP-StructureV3 版面分析
+        digital = is_digital_pdf(pdf_path)
+        if digital:
+            print(f"[STAGE 1] 数字版PDF -> PyMuPDF精确提取", flush=True)
+            logger.info("数字版PDF，使用PyMuPDF精确提取...")
+            elements = extract_digital_pdf(pdf_path)
+        else:
+            print(f"[STAGE 1] 扫描版PDF -> PP-StructureV3版面分析", flush=True)
+            logger.info("开始 PP-StructureV3 版面分析...")
+            elements = extract_with_layout_analysis(pdf_path, dpi=200)
         print(f"[STAGE 1] returned with {len(elements)} elements", flush=True)
         logger.info(f"提取到 {len(elements)} 个内容元素")
 
@@ -44,45 +52,16 @@ class PDFToWordPipeline:
         type_counter = Counter(e.type for e in elements)
         print(f"[DIAG] 元素类型分布: {dict(type_counter)}", flush=True)
 
-        # 0.1 诊断：非空文本元素数量
-        nonempty = sum(1 for e in elements if e.text and e.text.strip())
-        empty_text = sum(1 for e in elements if e.type in ('text','heading') and (not e.text or not e.text.strip()))
-        print(f"[DIAG] 非空文本: {nonempty}, 空文本: {empty_text}", flush=True)
-
-        # 0.2 诊断：前 3 个非空元素的内容样本
-        samples = [e for e in elements if e.text and e.text.strip()][:3]
-        for i, e in enumerate(samples):
-            preview = e.text[:80].replace('\n', ' ')
-            print(f"[DIAG] 样本{i+1} type={e.type} text={preview!r}", flush=True)
-
-        # 0.2.5 诊断：打印"X. 标题"和"X.Y.Z"开头的段落（这些常被误判为 heading）
-        import re as _re
-        number_prefix_re = _re.compile(r'^\d+([\.\．]\d+){0,3}[\.\．\s]')
-        for i, e in enumerate(elements[:200]):
-            if not e.text or not e.text.strip():
-                continue
-            t = e.text.strip()
-            if number_prefix_re.match(t) and len(t) < 80:
-                # 这是疑似"列表项"段落
-                print(
-                    f"[DIAG-LIST] i={i} type={e.type} font_size={e.font_size} "
-                    f"font_name={e.font_name!r} is_bold={e.is_bold} "
-                    f"alignment={e.alignment} text={t[:60]!r}",
-                    flush=True
-                )
-
-        # 0.3 诊断：表格/图片数量
-        tables_with_html = sum(1 for e in elements if e.type == 'table' and e.html)
-        images_with_data = sum(1 for e in elements if e.type == 'image' and e.image_data)
-        print(f"[DIAG] 表格(有html): {tables_with_html}, 图片(有data): {images_with_data}", flush=True)
-
         # 2. 检测正文字号基线
         body_size = detect_body_font_size(elements)
         logger.info(f"检测到正文字号: {body_size}pt")
 
         # 3. 标题层级推断 + 样式映射
+        #    目录条目(toc)不参与标题推断，保持制表位结构原样输出
         heading_count = 0
         for elem in elements:
+            if elem.type == 'toc':
+                continue
             if elem.type in ('heading', 'text'):
                 level = infer_heading_level(elem, body_size)
                 if level:
@@ -97,19 +76,15 @@ class PDFToWordPipeline:
                 else:
                     # 正文统一使用小四号 12pt（固定格式规范）
                     elem.mapped_size = float(BODY_FONT['size_pt'])
+                    # 行内run字号按映射比例缩放，保持行内相对大小
+                    # （如上标较小/局部强调较大），并规避Word半磅精度截断
+                    if elem.runs and elem.font_size and elem.font_size > 0:
+                        factor = elem.mapped_size / elem.font_size
+                        for rd in elem.runs:
+                            if rd.get('size') and rd['size'] > 0:
+                                rd['size'] = rd['size'] * factor
 
         logger.info(f"识别到 {heading_count} 个标题")
-
-        # 0.4 诊断：打印被判为 heading 的段落
-        for i, e in enumerate(elements):
-            if e.type == 'heading':
-                t = (e.text or '').strip()[:60]
-                print(
-                    f"[DIAG-HEAD] i={i} level={e.heading_level} "
-                    f"font_size={e.font_size} is_bold={e.is_bold} "
-                    f"alignment={e.alignment} mapped_size={e.mapped_size} text={t!r}",
-                    flush=True
-                )
 
         # 4. 生成Word文档
         logger.info("开始生成Word文档...")
