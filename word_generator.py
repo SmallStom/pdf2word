@@ -302,6 +302,8 @@ def _add_text_runs(paragraph, runs: List[dict], default_size_pt: float,
                               size_pt=size,
                               bold=run_bold,
                               italic=bool(rd.get('italic', False)))
+                if rd.get('underline'):
+                    run.font.underline = True
                 color = rd.get('color')
                 if color is not None and int(color) != 0:
                     c = int(color)

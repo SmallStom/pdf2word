@@ -1352,8 +1352,12 @@ def _dp_finalize_row(row: Dict) -> bool:
     供 _dp_group_rows 与双栏拆分（span 级重组行）复用。
     """
     row['spans'].sort(key=lambda s: s['bbox'][0])
-    row['x0'] = min(s['bbox'][0] for s in row['spans'])
-    row['x1'] = max(s['bbox'][2] for s in row['spans'])
+    # 行bbox只按真实文字span计算：注入的'_'虚拟span（填空线）不改变
+    # 行的几何范围，避免行尾长填空线把短行撑成"排满行"而错误合并
+    real = [s for s in row['spans'] if not s.get('_virtual')]
+    base = real or row['spans']
+    row['x0'] = min(s['bbox'][0] for s in base)
+    row['x1'] = max(s['bbox'][2] for s in base)
     row['y0'] = min(s['bbox'][1] for s in row['spans'])
     row['y1'] = max(s['bbox'][3] for s in row['spans'])
     row['text'], row['runs'] = _dp_build_row_text(row['spans'])
@@ -1371,6 +1375,101 @@ def _dp_finalize_row(row: Dict) -> bool:
     row['font'], row['bold'], row['italic'], row['color'] = dom
     row['size'] = max(size_chars, key=size_chars.get)
     return True
+
+
+def _dp_inject_underlines(page, rows: List[Dict], table_bboxes) -> None:
+    """把PDF矢量绘制的下划线还原进文本行（填空线/签字线）
+
+    招标文件中的填空下划线（"日期：___年"、"卖方：___（盖章）"）是
+    矢量线条而非字符，rawdict 文本提取不到。取页面绘图对象中的水平
+    线段（排除表格边框）：
+    - 与文字基本重合的线（签字线，文字打印在线上）：给覆盖的span
+      标记 is_underline，生成Word时文字带下划线样式；
+    - 线的净空隙段（文字之间的填空区）：按长度生成'_'字符虚拟span
+      插入行内（'_'宽约0.5em，数量按净隙宽/0.5字号折算）。
+
+    就地修改 rows：注入后调 _dp_finalize_row 重算行聚合信息。
+    """
+    try:
+        drawings = page.get_drawings()
+    except Exception:
+        return
+    # 1) 收集水平线段：|dy|<1pt，长10~260pt（过短为噪声，过长为
+    #    整页装饰分隔线），且不在表格bbox（±2pt，边框线）内
+    lines: List[Tuple[float, float, float]] = []  # (x0, x1, y)
+    for d in drawings:
+        for item in d.get('items', []):
+            x0 = x1 = y = None
+            if item[0] == 'l':  # 线段
+                p1, p2 = item[1], item[2]
+                if abs(p1.y - p2.y) < 1.0:
+                    x0, x1, y = min(p1.x, p2.x), max(p1.x, p2.x), p1.y
+            elif item[0] == 're':  # 细扁矩形（实心下划线）
+                r = item[1]
+                if r.height < 1.5:
+                    x0, x1, y = r.x0, r.x1, (r.y0 + r.y1) / 2
+            if x0 is None or not (10 <= x1 - x0 <= 260):
+                continue
+            in_table = any(b[0] - 2 <= x0 and x1 <= b[2] + 2
+                           and b[1] - 2 <= y <= b[3] + 2
+                           for b in table_bboxes)
+            if not in_table:
+                lines.append((x0, x1, y))
+    if not lines or not rows:
+        return
+
+    changed_rows = set()
+    for x0, x1, y in lines:
+        # 2) 找所属行：线在行baseline下方0~8pt（紧贴文字基线），
+        #    且与行x范围有交集
+        best, best_dy = None, 1e9
+        for r in rows:
+            dy = y - r['baseline']
+            if 0 <= dy <= 8 and dy < best_dy \
+                    and not (x1 < r['x0'] - 2 or x0 > r['x1'] + 2):
+                best, best_dy = r, dy
+        if best is None:
+            continue
+        size = max(best['size'], 1.0)
+        spans = sorted(best['spans'], key=lambda s: s['bbox'][0])
+        # 3) 签字线：某span与线重叠>=80%span宽且>=50%线宽 -> 文字带线
+        for s in spans:
+            ov = min(s['bbox'][2], x1) - max(s['bbox'][0], x0)
+            if ov >= 0.8 * (s['bbox'][2] - s['bbox'][0]) \
+                    and ov >= 0.5 * (x1 - x0):
+                s['is_underline'] = True
+        # 4) 填空线：线范围内未被文字占用的净隙段生成'_'虚拟span
+        gaps = []  # (净隙x0, 净隙x1)
+        cur = x0
+        for s in spans:
+            sx0, sx1 = s['bbox'][0], s['bbox'][2]
+            if sx1 <= cur or sx0 >= x1:
+                continue
+            if sx0 - cur >= 10:
+                gaps.append((cur, sx0))
+            cur = max(cur, sx1)
+        if x1 - cur >= 10:
+            gaps.append((cur, x1))
+        for gx0, gx1 in gaps:
+            n = max(2, round((gx1 - gx0) / (0.5 * size)))
+            best['spans'].append({
+                'text': '_' * n,
+                'bbox': [gx0, best['y0'], gx1, best['y1']],
+                'origin': [gx0, best['baseline']],
+                'font': best['font'],
+                'size': size,
+                'color': best['color'],
+                'is_bold': False,
+                'is_italic': False,
+                'is_underline': False,
+                '_virtual': True,
+            })
+        if gaps or any(s.get('is_underline') for s in best['spans']):
+            changed_rows.add(id(best))
+
+    for r in rows:
+        if id(r) in changed_rows:
+            _dp_finalize_row(r)
 
 
 def _dp_split_two_columns(rows: List[Dict]) -> List[List[Dict]]:
@@ -1396,6 +1495,9 @@ def _dp_split_two_columns(rows: List[Dict]) -> List[List[Dict]]:
             continue
         size = max(r['size'], 1.0)
         spans = sorted(r['spans'], key=lambda s: s['bbox'][0])
+        # 填空线虚拟span会填平行内大间隙（如"买方：___（盖章）"），
+        # 走廊候选与排满例外须在真实文字span之间检测
+        spans = [s for s in spans if not s.get('_virtual')]
         if r['x1'] >= content_right - 0.5 * size:
             # 排满整行不参与（中段间隙是排版挤压），但行内存在
             # 超大间隙(>5*字号)时例外（右栏贴右缘的签字区行）
@@ -1438,10 +1540,16 @@ def _dp_split_two_columns(rows: List[Dict]) -> List[List[Dict]]:
         rs = [s for s in spans if (s['bbox'][0] + s['bbox'][2]) / 2 >= best_x]
         if not ls or not rs:
             return None  # 一侧为空却跨线：异常
-        if max(s['bbox'][2] for s in ls) > best_x + 2 \
-                or min(s['bbox'][0] for s in rs) < best_x - 2:
+        # 跨线与间隙检查只针对真实文字span：填空线虚拟span可能
+        # 横跨走廊线，按中心就近归属即可
+        lreal = [s for s in ls if not s.get('_virtual')]
+        rreal = [s for s in rs if not s.get('_virtual')]
+        if not lreal or not rreal:
+            return None  # 某侧无文字锚点（只剩填空线），不拆
+        if max(s['bbox'][2] for s in lreal) > best_x + 2 \
+                or min(s['bbox'][0] for s in rreal) < best_x - 2:
             return None  # 有span跨线（通栏行等）
-        gap = min(s['bbox'][0] for s in rs) - max(s['bbox'][2] for s in ls)
+        gap = min(s['bbox'][0] for s in rreal) - max(s['bbox'][2] for s in lreal)
         if gap <= 0.3 * max(r['size'], 1):
             return None  # 间隙过小，可能只是词间距
         lrow = {'baseline': r['baseline'], 'spans': ls, 'size': r['size'],
@@ -1564,7 +1672,8 @@ def _dp_build_row_text(spans: List[Dict]):
                 if runs:
                     runs[-1]['text'] += ' '
         texts.append(piece)
-        style_key = (round(s['size'], 1), s['is_bold'], s['is_italic'], s['color'])
+        style_key = (round(s['size'], 1), s['is_bold'], s['is_italic'],
+                     s['color'], s.get('is_underline', False))
         if runs and runs[-1]['key'] == style_key:
             runs[-1]['text'] += piece
         else:
@@ -1575,6 +1684,7 @@ def _dp_build_row_text(spans: List[Dict]):
                 'bold': s['is_bold'],
                 'italic': s['is_italic'],
                 'color': s['color'],
+                'underline': s.get('is_underline', False),
             })
         prev = s
     text = ''.join(texts).strip()
@@ -1950,6 +2060,8 @@ def extract_digital_pdf(pdf_path: str) -> List[ContentElement]:
         spans = [s for s in spans
                  if not _dp_span_in_tables(s, table_bboxes)]
         rows = _dp_group_rows(spans)
+        # 矢量填空下划线还原（表格边框线已排除）
+        _dp_inject_underlines(page, rows, table_bboxes)
         page_rows.append(rows)
         page_tables.append(table_elems)
         page_meta.append({'width': page.rect.width, 'height': page.rect.height,
