@@ -316,13 +316,16 @@ def add_body_paragraph(doc: Document, text: str, size_pt: float = None,
                        alignment: str = 'left', bold: bool = False,
                        runs: Optional[List[dict]] = None,
                        color: Optional[int] = None,
-                       left_indent_pt: float = 0.0):
+                       left_indent_pt: float = 0.0,
+                       first_line_indent_pt: Optional[float] = None):
     """添加正文段落
 
     宋体+Times New Roman，小四号(12pt)或指定字号，1.5倍行距，首行缩进2字符
     - runs: PDF行内异体样式run列表（保留混排字号/加粗/颜色）
     - color: 段落主色（runs为空时生效）
-    - left_indent_pt: 左缩进（目录层级等）
+    - left_indent_pt: 左缩进（目录层级/块缩进还原）
+    - first_line_indent_pt: 首行缩进；None=配置的2字符，
+      数值=按PDF几何还原（悬挂/深缩进，已按字号映射缩放）
     """
     p = doc.add_paragraph()
     actual_size = size_pt if size_pt and size_pt > 0 else BODY_FONT['size_pt']
@@ -340,10 +343,14 @@ def add_body_paragraph(doc: Document, text: str, size_pt: float = None,
                            space_before=BODY_FONT['space_before_pt'],
                            space_after=BODY_FONT['space_after_pt'],
                            snap_to_grid=BODY_FONT['snap_to_grid'])
-    # 首行缩进 2 字符 = 2 * 字号（仅左对齐正文需要，居中/右对齐/目录条目不缩进）
+    # 首行缩进（仅左对齐正文需要，居中/右对齐不缩进）
+    # None/未指定 = 配置的2字符；数值 = PDF几何还原
     if alignment == 'left' and not _is_toc_entry(text):
-        indent_pt = actual_size * BODY_FONT['first_line_indent_chars']
-        p.paragraph_format.first_line_indent = Pt(indent_pt)
+        if first_line_indent_pt is not None:
+            p.paragraph_format.first_line_indent = Pt(max(0.0, first_line_indent_pt))
+        else:
+            indent_pt = actual_size * BODY_FONT['first_line_indent_chars']
+            p.paragraph_format.first_line_indent = Pt(indent_pt)
     if left_indent_pt > 0:
         p.paragraph_format.left_indent = Pt(left_indent_pt)
     if alignment == 'center':
@@ -808,6 +815,7 @@ def generate_word(elements: List[ContentElement], output_path: str):
                 runs=elem.runs,
                 color=elem.color,
                 left_indent_pt=elem.left_indent_pt,
+                first_line_indent_pt=elem.first_line_indent_pt,
             )
             content_added = True
             added_counts['text'] += 1

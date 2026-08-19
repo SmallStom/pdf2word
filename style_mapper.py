@@ -103,10 +103,12 @@ def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]
             if len(text) <= 40 and not (ends_sentence and len(text) > 20):
                 return pattern_level
             return None
-        # 弱模式："N. 标题" / "N.M 标题"：需加粗或字号大于正文佐证
+        # 弱模式："N. 标题" / "N.M 标题"：需加粗或字号大于正文佐证；
+        # 扫描件无字体信息，版面分析判定的段落小标题可直接采信
         if ends_sentence:
             return None
-        if is_bold or (font_size > 0 and body_size > 0 and font_size > body_size + 0.5):
+        if (is_bold or getattr(elem, 'layout_is_title', False)
+                or (font_size > 0 and body_size > 0 and font_size > body_size + 0.5)):
             if len(text) <= 40:
                 return pattern_level
         return None
@@ -114,6 +116,12 @@ def infer_heading_level(elem: ContentElement, body_size: float) -> Optional[int]
     # ---- 信号3：加粗且字号略大于正文 ----
     if (is_bold and font_size > 0 and body_size > 0
             and font_size > body_size + 0.5 and len(text) <= 40):
+        return 4
+
+    # ---- 信号4：版面分析判定的段落小标题（扫描件无字体信号） ----
+    # 无编号模式的小标题（如"投标人须知"）按四级处理，进大纲视图
+    if getattr(elem, 'layout_is_title', False) and not ends_sentence \
+            and len(text) <= 40:
         return 4
 
     return None

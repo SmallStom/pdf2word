@@ -83,6 +83,14 @@ class PDFToWordPipeline:
                         for rd in elem.runs:
                             if rd.get('size') and rd['size'] > 0:
                                 rd['size'] = rd['size'] * factor
+                    # 缩进按同比例换算到映射字号（PDF 10.4pt 的 2字符
+                    # 缩进 -> 12pt 字号下约 2字符），并设上限防误检远端行
+                    if elem.font_size and elem.font_size > 0:
+                        factor = elem.mapped_size / elem.font_size
+                        if elem.left_indent_pt:
+                            elem.left_indent_pt = min(elem.left_indent_pt * factor, 300.0)
+                        if elem.first_line_indent_pt is not None:
+                            elem.first_line_indent_pt = elem.first_line_indent_pt * factor
 
         logger.info(f"识别到 {heading_count} 个标题")
 

@@ -56,10 +56,17 @@ class ContentElement:
     is_toc: bool = False
     toc_title: str = ''
     toc_page_no: str = ''
-    # 相对正文左边界的左缩进（pt），目录层级/列表缩进用
+    # 相对正文左边界的左缩进（pt）：目录层级/整体块缩进（金额阶梯等）
     left_indent_pt: float = 0.0
+    # 首行缩进（pt）：None=用配置的首行缩进2字符；数值=按PDF几何还原
+    # （悬挂缩进/深缩进），生成时按字号映射比例缩放
+    first_line_indent_pt: Optional[float] = None
     # 该元素所在页是否为横版（宽>高），Word生成时切换分节方向
     is_landscape: bool = False
+    # ---- OCR路径专用（extract_with_layout_analysis）----
+    # 版面分析判定为段落小标题（paragraph_title）且无字体信息佐证
+    # （纯扫描件）时置True，标题推断时弱模式免加粗/字号佐证
+    layout_is_title: bool = False
 
 
 # ============================================================
@@ -396,6 +403,8 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                     is_bold=style['is_bold'],
                     is_italic=style['is_italic'],
                     alignment=alignment,
+                    # 纯扫描件无字号信号，doc_title 直接按一级标题
+                    heading_level=1 if not matched_spans else None,
                 ))
             elif block_type in ('text', 'paragraph', 'content', 'reference',
                                  'abstract', 'algorithm', 'header', 'footer',
@@ -411,6 +420,9 @@ def _parse_layout_result(res, page_num: int, page_width: float,
                     is_bold=style['is_bold'],
                     is_italic=style['is_italic'],
                     alignment=alignment,
+                    # 扫描件无字体佐证，弱模式标题凭版面标签采信
+                    layout_is_title=(block_type == 'paragraph_title'
+                                     and not matched_spans),
                 ))
             elif block_type in ('table', 'wired_table', 'wireless_table'):
                 # 表格的 HTML 可能在多个字段
@@ -495,7 +507,63 @@ def _parse_layout_result(res, page_num: int, page_width: float,
     if page_blocks:
         elements = _merge_elements_by_text_blocks(elements, page_blocks, page_width)
 
+    # 7. OCR段落修正：块内排版换行流式合并 + 几何缩进还原
+    _apply_ocr_paragraph_fixups(elements)
+
     return elements
+
+
+def _flow_join_lines(text: str) -> str:
+    """把OCR块内的排版换行合并为流式段落文本
+
+    OCR block_content 中的 '\\n' 是 PDF 行宽排版产物，转成 Word 流式
+    段落后应由 Word 自动换行（硬换行会导致每行提前断行）。断词规则：
+    - 行尾连字符+行首字母：英文断词，去连字符直接连接
+    - 行尾与行首均为ASCII字母数字：补一个空格
+    - 其余（中文/标点边界）：直接连接
+    """
+    lines = [ln.strip() for ln in text.split('\n') if ln.strip()]
+    if len(lines) <= 1:
+        return '\n'.join(lines)
+    out = lines[0]
+    for ln in lines[1:]:
+        tail, head = out[-1:], ln[:1]
+        if out.endswith('-') and head.isascii() and head.isalpha():
+            out = out[:-1] + ln  # 英文断词
+        elif tail.isascii() and tail.isalnum() and head.isascii() and head.isalnum():
+            out += ' ' + ln  # 英文单词边界补空格
+        else:
+            out += ln
+    return out
+
+
+def _apply_ocr_paragraph_fixups(elements: List[ContentElement]) -> None:
+    """OCR路径段落后处理（extract_with_layout_analysis 专用）
+
+    1. 流式合并：正文块内的排版换行合并（见 _flow_join_lines）。
+    2. 几何缩进还原：块bbox左缘相对本页正文左边界的偏移即整体块缩进
+       （阶梯缩进/引用块等）；普通"首行缩进+后续行顶格"的段落块左缘
+       就是正文左缘（偏移0），保持默认首行缩进2字符，恰好正确。
+    """
+    # 正文左边界：本页宽块（>=50pt）的最小 x0，窄块（页码等）不参与
+    body_x0s = [e.bbox[0] for e in elements
+                if e.type in ('text', 'heading') and e.bbox
+                and (e.bbox[2] - e.bbox[0]) >= 50]
+    content_left = min(body_x0s) if body_x0s else 0.0
+
+    for e in elements:
+        if e.type != 'text':
+            continue
+        if e.text and '\n' in e.text:
+            e.text = _flow_join_lines(e.text)
+        if e.bbox and len(e.bbox) == 4 and (e.bbox[2] - e.bbox[0]) >= 50:
+            # 窄块（页码/孤立短字）无缩进语义，跳过
+            off = e.bbox[0] - content_left
+            # 超过约1字符（12pt）的偏移视为整体块缩进（噪声防护），
+            # 首行缩进归零：块缩进已覆盖所有行的起始位置
+            if off > 12:
+                e.left_indent_pt = round(min(off, 200.0), 1)
+                e.first_line_indent_pt = 0.0
 
 
 def _build_simple_table_html(table_ocr_pred: Dict) -> str:
@@ -1272,26 +1340,164 @@ def _dp_group_rows(spans: List[Dict]) -> List[Dict]:
     # 行内排序并计算行bbox/文本/runs
     result = []
     for row in rows:
-        row['spans'].sort(key=lambda s: s['bbox'][0])
-        xs0 = min(s['bbox'][0] for s in row['spans'])
-        xs1 = max(s['bbox'][2] for s in row['spans'])
-        ys0 = min(s['bbox'][1] for s in row['spans'])
-        ys1 = max(s['bbox'][3] for s in row['spans'])
-        row['x0'], row['x1'] = xs0, xs1
-        row['y0'], row['y1'] = ys0, ys1
-        row['text'], row['runs'] = _dp_build_row_text(row['spans'])
-        if not row['text']:
-            continue
-        # 行级样式聚合（run级样式已保留，这里给段落判断用）
-        chars = {}
-        for s in row['spans']:
-            k = (s['font'], s['is_bold'], s['is_italic'], s['color'])
-            chars[k] = chars.get(k, 0) + len(s['text'].strip())
-        dom = max(chars, key=chars.get)
-        row['font'], row['bold'], row['italic'], row['color'] = dom
-        result.append(row)
+        if _dp_finalize_row(row):
+            result.append(row)
     result.sort(key=lambda r: (r['baseline'], r['x0']))
     return result
+
+
+def _dp_finalize_row(row: Dict) -> bool:
+    """计算行bbox/文本/runs/行级样式；返回False表示空行（丢弃）
+
+    供 _dp_group_rows 与双栏拆分（span 级重组行）复用。
+    """
+    row['spans'].sort(key=lambda s: s['bbox'][0])
+    row['x0'] = min(s['bbox'][0] for s in row['spans'])
+    row['x1'] = max(s['bbox'][2] for s in row['spans'])
+    row['y0'] = min(s['bbox'][1] for s in row['spans'])
+    row['y1'] = max(s['bbox'][3] for s in row['spans'])
+    row['text'], row['runs'] = _dp_build_row_text(row['spans'])
+    if not row['text']:
+        return False
+    # 行级样式聚合（run级样式已保留，这里给段落判断用），
+    # 主字号取字符数最多的span
+    chars = {}
+    size_chars = {}
+    for s in row['spans']:
+        k = (s['font'], s['is_bold'], s['is_italic'], s['color'])
+        chars[k] = chars.get(k, 0) + len(s['text'].strip())
+        size_chars[s['size']] = size_chars.get(s['size'], 0) + len(s['text'].strip())
+    dom = max(chars, key=chars.get)
+    row['font'], row['bold'], row['italic'], row['color'] = dom
+    row['size'] = max(size_chars, key=size_chars.get)
+    return True
+
+
+def _dp_split_two_columns(rows: List[Dict]) -> List[List[Dict]]:
+    """检测页内局部双栏区（签字区等左右并排短行群）并拆成独立流
+
+    特征：多行在几乎同一 x 出现行内大间隙（右栏走廊），行未排满，
+    带内无 span 跨越走廊线。返回按阅读顺序重排的行序列列表，
+    调用方对每个序列分别组装段落；未检测到双栏时返回 [rows]。
+    """
+    if len(rows) < 4:
+        return [rows]
+    content_left = min(r['x0'] for r in rows)
+    content_right = max(r['x1'] for r in rows)
+    cw = content_right - content_left
+    if cw < 100:
+        return [rows]
+
+    # 1) 候选右栏起点：未排满行的行内大间隙(>1.2*字号)右span起点，
+    #    且 x 落在内容区中段（避开正文缩进和右缘贴边）
+    candidates: List[tuple] = []  # (x, row)
+    for r in rows:
+        if _dp_match_toc(r['text']):
+            continue
+        size = max(r['size'], 1.0)
+        spans = sorted(r['spans'], key=lambda s: s['bbox'][0])
+        if r['x1'] >= content_right - 0.5 * size:
+            # 排满整行不参与（中段间隙是排版挤压），但行内存在
+            # 超大间隙(>5*字号)时例外（右栏贴右缘的签字区行）
+            if not any(b['bbox'][0] - a['bbox'][2] > 5 * size
+                       for a, b in zip(spans, spans[1:])):
+                continue
+        for a, b in zip(spans, spans[1:]):
+            if b['bbox'][0] - a['bbox'][2] > 1.2 * size:
+                x = b['bbox'][0]
+                if content_left + 0.15 * cw <= x <= content_right - 0.20 * cw:
+                    candidates.append((x, r))
+    if not candidates:
+        return [rows]
+
+    # 2) ±2.5pt 聚类，取覆盖数最多（>=3行）的簇，簇均值为走廊线
+    candidates.sort(key=lambda c: c[0])
+    clusters: List[List[tuple]] = []
+    for x, r in candidates:
+        if clusters and x - clusters[-1][-1][0] <= 2.5:
+            clusters[-1].append((x, r))
+        else:
+            clusters.append([(x, r)])
+    best_x, best_rows = None, []
+    for cl in clusters:
+        if len(cl) >= 3 and len(cl) > len(best_rows):
+            best_x = sum(c[0] for c in cl) / len(cl)
+            best_rows = [c[1] for c in cl]
+    if best_x is None:
+        return [rows]
+
+    # 3) 候选行本身确定双栏带的 y 范围（左右栏同行已按基线合并，
+    #    锚点是"行内间隙右起点贴走廊线"的行）
+    y_top = min(r['y0'] for r in best_rows)
+    y_bot = max(r['y1'] for r in best_rows)
+
+    def _split_row(r: Dict):
+        """跨线行按 span 中心拆成左右两行；无法安全拆分返回 None"""
+        spans = sorted(r['spans'], key=lambda s: s['bbox'][0])
+        ls = [s for s in spans if (s['bbox'][0] + s['bbox'][2]) / 2 < best_x]
+        rs = [s for s in spans if (s['bbox'][0] + s['bbox'][2]) / 2 >= best_x]
+        if not ls or not rs:
+            return None  # 一侧为空却跨线：异常
+        if max(s['bbox'][2] for s in ls) > best_x + 2 \
+                or min(s['bbox'][0] for s in rs) < best_x - 2:
+            return None  # 有span跨线（通栏行等）
+        gap = min(s['bbox'][0] for s in rs) - max(s['bbox'][2] for s in ls)
+        if gap <= 0.3 * max(r['size'], 1):
+            return None  # 间隙过小，可能只是词间距
+        lrow = {'baseline': r['baseline'], 'spans': ls, 'size': r['size'],
+                '_dom_len': 0}
+        rrow = {'baseline': r['baseline'], 'spans': rs, 'size': r['size'],
+                '_dom_len': 0}
+        _dp_finalize_row(lrow)
+        _dp_finalize_row(rrow)
+        return lrow, rrow
+
+    # 4) 带内行分类：纯左/纯右/可按span拆分；span跨线则整页放弃
+    band = [r for r in rows if r['y1'] >= y_top - 1 and r['y0'] <= y_bot + 1]
+    left_flow: List[Dict] = []
+    right_flow: List[Dict] = []
+    for r in band:
+        if r['x1'] < best_x - 2:
+            left_flow.append(r)
+            continue
+        if r['x0'] > best_x + 2:
+            right_flow.append(r)
+            continue
+        parts = _split_row(r)
+        if parts is None:
+            return [rows]  # 带内跨线行不可拆（通栏行），放弃整页拆分
+        left_flow.append(parts[0])
+        right_flow.append(parts[1])
+    if not left_flow or not right_flow:
+        return [rows]
+    # 护栏：右流须为有语义内容的栏（平均每行>=2.5字符），
+    # 排除"人民币（大写）：元"阶梯缩进区的单字符假走廊
+    right_chars = sum(len(r['text'].strip()) for r in right_flow)
+    if right_chars < 2.5 * len(right_flow):
+        return [rows]
+    left_flow.sort(key=lambda r: r['baseline'])
+    right_flow.sort(key=lambda r: r['baseline'])
+
+    # 5) 带外行归流：带前行入左流（通常为通栏正文）；带后行按起点
+    #    x 归属（右栏下方的地址/账号等左栏续行回左流，起点在走廊
+    #    线右侧的行归右流），跨线行（如"年月日年月日"日期行）尝试
+    #    拆分，不可拆则归左流，各流保持 y 序
+    before = [r for r in rows if r['y1'] < y_top - 1]
+    after = [r for r in rows if r['y0'] > y_bot + 1]
+    left_flow = before + left_flow
+    for r in after:
+        if r['x0'] > best_x + 2:
+            right_flow.append(r)
+        elif r['x1'] >= best_x - 2:
+            parts = _split_row(r)
+            if parts is None:
+                left_flow.append(r)
+            else:
+                left_flow.append(parts[0])
+                right_flow.append(parts[1])
+        else:
+            left_flow.append(r)
+    return [left_flow, right_flow]
 
 
 def _dp_merge_orphan_fragments(rows: List[Dict]) -> List[Dict]:
@@ -1594,13 +1800,38 @@ def _dp_rows_to_elements(rows: List[Dict], page_num: int, page_width: float,
                 is_landscape=is_landscape,
             ))
             return
+        # ---- 缩进还原（相对正文左边界，单位pt）----
+        # block_off: 段落整体块缩进（所有行的最小起点-正文左边界）
+        # first_off: 首行相对段落块起点的额外缩进（悬挂缩进/深缩进）
+        para_x0 = min(r['x0'] for r in rows_)
+        ref_size = max(dom_row['size'], 1.0)
+        block_off = para_x0 - content_left
+        first_off = rows_[0]['x0'] - para_x0
+        left_indent_pt = 0.0
+        first_line_indent_pt = None  # None = 配置的首行缩进2字符
+        if alignment == 'left':
+            if len(rows_) == 1:
+                # 单行段：~2字符偏移按"首行缩进"语义（用配置值，与固定
+                # 格式规范一致）；更深的偏移视为块缩进原样还原
+                # （如"人民币（大写）"阶梯缩进、表单左缩进栏）
+                if block_off > 3.5 * ref_size:
+                    left_indent_pt = block_off
+                    first_line_indent_pt = 0.0
+            else:
+                # 多行段：续行位置=块缩进；首行与续行的差=首行缩进
+                if block_off > 0.8 * ref_size:
+                    left_indent_pt = block_off
+                    first_line_indent_pt = first_off
+                elif first_off > 3.5 * ref_size:
+                    first_line_indent_pt = first_off
         elements.append(ContentElement(
             type='text', text=text, bbox=bbox, page_num=page_num,
             font_name=dom_row['font'], font_size=dom_row['size'],
             is_bold=dom_row['bold'], is_italic=dom_row['italic'],
             color=dom_row['color'], alignment=alignment,
             runs=runs,
-            left_indent_pt=max(0.0, rows_[0]['x0'] - content_left),
+            left_indent_pt=left_indent_pt,
+            first_line_indent_pt=first_line_indent_pt,
             is_landscape=is_landscape,
         ))
 
@@ -1620,6 +1851,10 @@ def _dp_rows_to_elements(rows: List[Dict], page_num: int, page_width: float,
                         and row['bold'] == prev['bold'])
             # 上一行是否"排满"（右缘接近内容右边界）
             prev_full = prev['x1'] >= content_right - 0.04 * page_width
+            # 前行须从正文区左段起排（右置短行如"日期：___"虽然贴右缘，
+            # 但不是排满的续行源，防止其吞并下方独立短行）
+            prev_body_start = (prev['x0'] - content_left) <= 0.4 * (
+                content_right - content_left)
             # 当前行起点：回到正文左边界 = 续行；缩进1.2~3.5字符 = 首行/悬挂
             start_offset = row['x0'] - content_left
             cont_flush = start_offset <= 0.8 * max(row['size'], 1)
@@ -1646,7 +1881,8 @@ def _dp_rows_to_elements(rows: List[Dict], page_num: int, page_width: float,
             if line_ok and style_ok and prev_full:
                 if cont_center:
                     merge_ok = True
-                elif (cont_flush or cont_hanging) and not row_is_center:
+                elif (cont_flush or cont_hanging) and not row_is_center \
+                        and prev_body_start:
                     merge_ok = True
             if merge_ok:
                 para_rows.append(row)
@@ -1749,11 +1985,13 @@ def extract_digital_pdf(pdf_path: str) -> List[ContentElement]:
             return True
         return False
 
-    # 第二遍：过滤页眉页脚并组装段落
+    # 第二遍：过滤页眉页脚、拆分局部双栏并组装段落
     for pno, rows in enumerate(page_rows):
         meta = page_meta[pno]
         kept = [r for r in rows if not _is_header_footer(pno, r)]
-        elements.extend(_dp_rows_to_elements(kept, pno, meta['width'], meta['landscape']))
+        for seq in _dp_split_two_columns(kept):
+            elements.extend(
+                _dp_rows_to_elements(seq, pno, meta['width'], meta['landscape']))
         elements.extend(page_tables[pno])
 
     elements.sort(key=lambda e: (e.page_num,
